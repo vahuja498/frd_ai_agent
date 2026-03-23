@@ -6,7 +6,7 @@ expertMode = true
 channel = "stable-25_05"
 
 [deployment]
-run = ["sh", "-c", "bash frd_agent/app/start.sh"]
+run = ["sh", "-c", "bash start.sh"]
 deploymentTarget = "cloudrun"
 
 [[ports]]

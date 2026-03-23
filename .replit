@@ -4,3 +4,11 @@ expertMode = true
 
 [nix]
 channel = "stable-25_05"
+
+[deployment]
+run = ["sh", "-c", "bash frd_agent/app/start.sh"]
+deploymentTarget = "cloudrun"
+
+[[ports]]
+localPort = 8080
+externalPort = 80

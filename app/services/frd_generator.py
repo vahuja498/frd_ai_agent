@@ -1,10 +1,12 @@
 """
 FRD Generator Service
-Generates a stronger consulting-style FRD from extracted source documents,
-and always falls back to non-empty sections if the LLM fails.
 
-Output:
-- A structured .docx FRD saved in OUTPUT_DIR
+Generation strategy:
+1. Try Gemini first
+2. If Gemini fails, try Hugging Face
+3. If both fail, generate a strong deterministic fallback FRD
+
+The service always returns a non-empty, professionally structured DOCX.
 """
 
 from __future__ import annotations
@@ -22,29 +24,51 @@ from docx import Document
 from docx.enum.table import WD_TABLE_ALIGNMENT
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.shared import Inches, Pt
+from huggingface_hub import InferenceClient
 
 from app.config import settings
 
 logger = logging.getLogger(__name__)
 
-from huggingface_hub import InferenceClient
-
 
 class FRDGeneratorService:
-    def __init__(self) -> None:
-        self.hf_token = settings.HF_API_TOKEN
-        self.model = settings.HF_MODEL
+    SECTION_ORDER = [
+        "overview",
+        "document_history",
+        "current_state",
+        "proposed_solution",
+        "roles",
+        "application_types",
+        "modules_and_applications",
+        "process_flows",
+        "functional_requirements",
+        "non_functional_requirements",
+        "integrations",
+        "notifications",
+        "reporting_visibility",
+        "gap_analysis",
+        "out_of_scope",
+        "assumptions_constraints",
+        "acceptance_signoff",
+    ]
 
-        self.output_dir = Path(settings.OUTPUT_DIR)
+    def __init__(self) -> None:
+        self.output_dir = Path(getattr(settings, "OUTPUT_DIR", "output"))
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        self.client = InferenceClient(api_key=self.hf_token)
+        self.gemini_api_key = (getattr(settings, "GEMINI_API_KEY", "") or "").strip()
+        self.gemini_model = (
+            getattr(settings, "GEMINI_MODEL", "") or "gemini-1.5-flash"
+        ).strip()
 
-        self.api_url = f"https://api-inference.huggingface.co/models/{self.model}"
-        self.http_headers = {
-            "Authorization": f"Bearer {self.hf_token}",
-            "Content-Type": "application/json",
-        }
+        self.hf_api_token = (getattr(settings, "HF_API_TOKEN", "") or "").strip()
+        self.hf_model = (
+            getattr(settings, "HF_MODEL", "") or "mistralai/Mistral-7B-Instruct-v0.3"
+        ).strip()
+
+        self.hf_client: Optional[InferenceClient] = None
+        if self.hf_api_token:
+            self.hf_client = InferenceClient(api_key=self.hf_api_token)
 
     async def generate_frd(self, work_item_id: int, documents: List[Any]) -> Path:
         if not documents:
@@ -53,36 +77,14 @@ class FRDGeneratorService:
         normalized_docs = self._normalize_documents(documents)
         combined_source = self._combine_documents(normalized_docs)
 
-        logger.info("🧠 Extracting structured project context...")
         context = await self._extract_project_context(
             work_item_id=work_item_id,
             combined_source=combined_source,
             documents=normalized_docs,
         )
 
-        logger.info("📝 Generating FRD sections...")
-        section_names = [
-            "overview",
-            "document_history",
-            "current_state",
-            "proposed_solution",
-            "roles",
-            "application_types",
-            "modules_and_applications",
-            "process_flows",
-            "functional_requirements",
-            "non_functional_requirements",
-            "integrations",
-            "notifications",
-            "reporting_visibility",
-            "gap_analysis",
-            "out_of_scope",
-            "assumptions_constraints",
-            "acceptance_signoff",
-        ]
-
         sections: Dict[str, str] = {}
-        for section_name in section_names:
+        for section_name in self.SECTION_ORDER:
             sections[section_name] = await self._generate_section(
                 section_name=section_name,
                 work_item_id=work_item_id,
@@ -90,7 +92,6 @@ class FRDGeneratorService:
                 combined_source=combined_source,
             )
 
-        logger.info("📄 Building DOCX...")
         output_path = self._build_docx(
             work_item_id=work_item_id,
             context=context,
@@ -98,11 +99,15 @@ class FRDGeneratorService:
             sections=sections,
         )
 
-        logger.info(f"✅ FRD generated at {output_path}")
+        logger.info(
+            "FRD generated successfully | work_item_id=%s | path=%s",
+            work_item_id,
+            output_path,
+        )
         return output_path
 
     # -------------------------------------------------------------------------
-    # Document prep
+    # Document preparation
     # -------------------------------------------------------------------------
 
     def _normalize_documents(self, documents: List[Any]) -> List[Dict[str, Any]]:
@@ -126,7 +131,12 @@ class FRDGeneratorService:
                 }
             )
 
+        normalized.sort(key=lambda d: self._doc_type_rank(d.get("doc_type", "other")))
         return normalized
+
+    def _doc_type_rank(self, doc_type: str) -> int:
+        order = {"sow": 0, "mom": 1, "transcript": 2, "other": 3}
+        return order.get((doc_type or "other").lower(), 9)
 
     def _combine_documents(self, documents: List[Dict[str, Any]]) -> str:
         parts: List[str] = []
@@ -142,10 +152,10 @@ Content:
 """
             )
 
-        return self._truncate("\n\n".join(parts), 50000)
+        return self._truncate("\n\n".join(parts).strip(), 50000)
 
     def _clean_text(self, text: str) -> str:
-        text = unescape(text)
+        text = unescape(text or "")
         text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
         text = re.sub(r"</p>", "\n", text, flags=re.IGNORECASE)
         text = re.sub(r"<li[^>]*>", "- ", text, flags=re.IGNORECASE)
@@ -156,12 +166,13 @@ Content:
         return text.strip()
 
     def _truncate(self, text: str, max_chars: int) -> str:
+        text = text or ""
         if len(text) <= max_chars:
             return text
-        return text[:max_chars] + "\n\n[TRUNCATED FOR MODEL INPUT]"
+        return text[: max_chars - 200].rstrip() + "\n\n[TRUNCATED]"
 
     # -------------------------------------------------------------------------
-    # LLM orchestration
+    # Context extraction
     # -------------------------------------------------------------------------
 
     async def _extract_project_context(
@@ -174,24 +185,21 @@ Content:
             {
                 "filename": d["filename"],
                 "doc_type": d["doc_type"],
+                "chars": len(d["content"]),
             }
             for d in documents
         ]
 
         prompt = f"""
-You are a senior Business Analyst.
+You are a senior business analyst creating an implementation-ready FRD context summary.
 
-Extract structured project context from the source material below.
-Return STRICT JSON only. No markdown. No commentary.
-
-Required JSON schema:
+Return valid JSON only with this shape:
 {{
   "project_name": "",
   "client_name": "",
   "business_context": "",
-  "business_objectives": ["", ""],
-  "current_state": "",
-  "proposed_solution": "",
+  "goals": ["", ""],
+  "users": ["", ""],
   "roles": [
     {{
       "role": "",
@@ -201,20 +209,12 @@ Required JSON schema:
   "application_types": ["", ""],
   "modules": [
     {{
-      "name": "",
+      "module_name": "",
       "purpose": "",
       "users": ["", ""],
       "features": ["", ""],
       "key_fields": ["", ""],
-      "exceptions": ["", ""]
-    }}
-  ],
-  "process_flows": ["", ""],
-  "functional_requirements": ["", ""],
-  "non_functional_requirements": [
-    {{
-      "category": "",
-      "requirement": ""
+      "validations": ["", ""]
     }}
   ],
   "integrations": [
@@ -240,10 +240,9 @@ Required JSON schema:
 
 Rules:
 1. Do not invent facts.
-2. If information is missing, use "To be confirmed".
-3. Exclude commercial payment schedule unless it directly impacts scope/constraints.
-4. Convert raw text into implementation-focused understanding.
-5. Prefer source-backed business and functional meaning over copy-pasting.
+2. If a fact is unknown, use "To be confirmed".
+3. Prefer business and functional interpretation over raw copying.
+4. Keep the JSON concise but meaningful.
 
 Work Item ID: {work_item_id}
 Source Manifest:
@@ -251,16 +250,18 @@ Source Manifest:
 
 Source Content:
 {combined_source}
-"""
+""".strip()
 
-        raw = await self._call_model(prompt, max_new_tokens=2200, temperature=0.2)
+        raw = await self._call_model(prompt, max_output_tokens=2200, temperature=0.2)
         parsed = self._parse_json_response(raw)
 
-        if not parsed:
-            logger.warning("⚠️ Structured extraction failed; using heuristic fallback.")
-            parsed = self._fallback_context(work_item_id, documents, combined_source)
+        if parsed:
+            return parsed
 
-        return parsed
+        logger.warning(
+            "Structured context extraction failed; using deterministic fallback context."
+        )
+        return self._fallback_context(work_item_id, documents, combined_source)
 
     async def _generate_section(
         self,
@@ -269,275 +270,271 @@ Source Content:
         context: Dict[str, Any],
         combined_source: str,
     ) -> str:
-        section_instructions = {
+        section_instructions = self._section_instructions()
+        instruction = section_instructions[section_name]
+
+        prompt = f"""
+You are a senior functional consultant writing a polished, client-ready Functional Requirements Document.
+
+Write only the requested section content.
+Do not add a section title.
+Do not mention that you are an AI.
+Do not invent facts.
+Use "To be confirmed" where information is unavailable.
+Prefer implementation-ready language and concise structure.
+Where suitable, use markdown lists or markdown tables.
+
+Work Item ID: {work_item_id}
+
+Structured Context:
+{json.dumps(context, indent=2)}
+
+Available Source Content:
+{self._truncate(combined_source, 20000)}
+
+Section Instructions:
+{instruction}
+""".strip()
+
+        raw = await self._call_model(prompt, max_output_tokens=1600, temperature=0.25)
+        cleaned = self._clean_llm_output(raw)
+
+        if cleaned and len(cleaned) >= 40:
+            return cleaned
+
+        logger.warning(
+            "LLM section generation failed; using fallback | section=%s", section_name
+        )
+        return self._fallback_section(section_name, context, combined_source)
+
+    def _section_instructions(self) -> Dict[str, str]:
+        return {
             "overview": """
-Write Section 1: Overview.
-Include:
+Write a strong executive overview covering:
 - project name
 - client name
 - business context
+- problem/opportunity
 - purpose of the solution
 - expected business outcomes
-Write in polished consulting language.
+Use professional consulting language.
 """,
             "document_history": """
-Write Section 2: Document History.
-Return a short markdown table with columns:
+Return a short markdown table:
 | Date | Version | Description | Author |
-Use today's generation as version 1.0 draft by FRD AI Agent.
+Include today's draft as version 1.0 by FRD AI Agent.
 """,
             "current_state": """
-Write Section 3: Current State / Status Quo.
-Describe the current pain points, current/manual process, business limitations, and why change is needed.
-Do not invent details. Use 'To be confirmed' if needed.
+Describe the current-state process, pain points, manual activities, delays, errors, or visibility issues.
+State only what is supported or clearly implied by the source.
 """,
             "proposed_solution": """
-Write Section 4: Proposed / Requested Solution.
-Describe the target solution in business and functional terms.
-Explain what the future-state system should achieve.
+Describe the requested future-state solution in business and functional terms.
+Explain what the platform/process should enable.
 """,
             "roles": """
-Write Section 4.1: Roles.
-Return a markdown table with:
+Return a markdown table:
 | Role | Responsibility |
-Make it clean and concise.
+Use clear, implementation-ready responsibilities.
 """,
             "application_types": """
-Write Section 4.2: Type of Applications.
-Explain the likely app types or solution components required.
-Examples may include Canvas App, Model-Driven App, API, Portal, Admin Console, Reporting Layer.
-Only include what is grounded in source or clearly implied.
+Explain the likely solution components or application types required.
+Examples may include Model-Driven App, Portal, API, Admin UI, Reporting Layer, Automation Workflow.
+Only include what is grounded in the source.
 """,
             "modules_and_applications": """
-Write Section 4.3: Modules and Applications.
 Break the solution into modules.
 For each module include:
-- Module Name
-- Purpose
-- Users
-- Core Features
-- Key Fields / Data Points
-- Validations / Exceptions
-Use subheadings and professional detail.
+- module name
+- purpose
+- users
+- core features
+- key fields or data points
+- validations or exceptions
+Use subheadings and crisp bullets.
 """,
             "process_flows": """
-Write Section 4.4: Process Flows.
-Document major end-to-end business flows in numbered format.
-Focus on user steps, system actions, decisions, and exception paths.
+Document the main end-to-end business flows in numbered format.
+Cover user step, system action, decision, and exception handling where relevant.
 """,
             "functional_requirements": """
-Write Section 4.5: Functional Requirements.
-Return a high-quality numbered list using this format:
+Return a numbered requirement list in this exact style:
 FR-001: ...
 FR-002: ...
-Each requirement must be specific, testable, and implementation-oriented.
-Generate at least 12 strong requirements if source supports it.
-Do not write placeholders like 'review source documents'.
+Requirements must be specific, testable, and implementation-oriented.
+Generate at least 12 strong requirements if the source supports it.
 """,
             "non_functional_requirements": """
-Write Section 4.6: Non-Functional Requirements.
-Return a markdown table with:
-| ID | Category | Requirement |
-Use IDs NFR-001, NFR-002, etc.
-Keep only relevant requirements grounded in the source or standard solution expectations.
+Return a numbered requirement list in this exact style:
+NFR-001: ...
+NFR-002: ...
+Include performance, security, auditability, usability, maintainability, reliability, and compliance considerations when relevant.
 """,
             "integrations": """
-Write Section 4.7: Integrations.
-Return a markdown table with:
+Describe integrations in a markdown table:
 | System | Purpose | Data Exchanged |
-If unknown, use 'To be confirmed'.
+If unclear, state "To be confirmed".
 """,
             "notifications": """
-Write Section 4.8: Notifications.
-Describe operational notifications, alerts, reminders, escalations, and communication needs.
-If not clearly defined, say 'To be confirmed' but still frame the section professionally.
+List user/system notifications and triggers in bullet format.
 """,
             "reporting_visibility": """
-Write Section 4.9: Reporting / Visibility.
-Describe dashboard, reporting, audit trail, visibility, status tracking, and monitoring requirements.
+List reporting, dashboard, audit trail, and visibility needs in bullet format.
 """,
             "gap_analysis": """
-Write Section 4.10: GAP Analysis.
 Return a markdown table:
 | Gap | Proposed Solution | Reference Section | Phase |
-Focus on meaningful implementation gaps, not generic filler.
 """,
             "out_of_scope": """
-Write Section 4.11: Out of Scope.
-List clear exclusions based on source. If unclear, state likely exclusions conservatively and mark as 'To be confirmed'.
+List items explicitly out of scope or not yet confirmed.
+If nothing is stated, produce cautious bullets using 'To be confirmed'.
 """,
             "assumptions_constraints": """
-Write Section 4.12: Assumptions and Constraints.
-Separate assumptions from constraints.
-Include data residency, timeline, access dependencies, stakeholder availability, and compliance constraints where relevant.
+List assumptions and constraints separately in bullets.
 """,
             "acceptance_signoff": """
-Write Section 4.13: Acceptance / Sign-off.
-Provide a short formal acceptance section with a markdown sign-off table:
+Return a short acceptance/sign-off section and include a markdown sign-off table:
 | Name | Role | Signature | Date |
 """,
         }
 
-        instruction = section_instructions[section_name]
+    # -------------------------------------------------------------------------
+    # Model calling chain
+    # -------------------------------------------------------------------------
 
-        prompt = f"""
-You are a senior Business Analyst writing a client-ready FRD.
+    async def _call_model(
+        self,
+        prompt: str,
+        max_output_tokens: int = 1200,
+        temperature: float = 0.2,
+    ) -> str:
+        gemini_error: Optional[str] = None
+        hf_error: Optional[str] = None
 
-{instruction}
+        if self.gemini_api_key:
+            try:
+                logger.info("Trying Gemini generation")
+                text = await self._call_gemini(
+                    prompt=prompt,
+                    max_output_tokens=max_output_tokens,
+                    temperature=temperature,
+                )
+                if text and text.strip():
+                    return text.strip()
+            except Exception as exc:
+                gemini_error = str(exc)
+                logger.warning("Gemini generation failed | error=%s", exc)
 
-Rules:
-1. Write clean, professional FRD content.
-2. Do not repeat raw source text blindly.
-3. Do not include payment schedules unless directly relevant to scope/constraints.
-4. If information is missing, write 'To be confirmed'.
-5. Do not leave the section empty.
-6. Keep terminology consistent.
+        if self.hf_client and self.hf_api_token:
+            try:
+                logger.info("Trying Hugging Face generation")
+                text = await self._call_huggingface(
+                    prompt=prompt,
+                    max_output_tokens=max_output_tokens,
+                    temperature=temperature,
+                )
+                if text and text.strip():
+                    return text.strip()
+            except Exception as exc:
+                hf_error = str(exc)
+                logger.warning("Hugging Face generation failed | error=%s", exc)
 
-Context JSON:
-{json.dumps(context, indent=2)}
-
-Source Content:
-{self._truncate(combined_source, 20000)}
-"""
-
-        result = await self._call_model(
-            prompt,
-            max_new_tokens=1800,
-            temperature=0.25,
+        logger.warning(
+            "All model providers failed; using deterministic fallback | gemini_error=%s | hf_error=%s",
+            gemini_error,
+            hf_error,
         )
-
-        if result and result.strip():
-            return result.strip()
-
-        return self._fallback_section(section_name, context, combined_source)
-
-        async def _call_model(
-            self,
-            prompt: str,
-            max_new_tokens: int = 1200,
-            temperature: float = 0.2,
-        ) -> str:
-            gemini_result = await self._call_gemini(
-                prompt=prompt,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-            )
-            if gemini_result:
-                logger.info("✅ Gemini response received.")
-                return gemini_result
-
-            logger.warning(
-                "⚠️ Gemini failed or returned empty output. Trying Hugging Face..."
-            )
-
-            hf_result = await self._call_huggingface(
-                prompt=prompt,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-            )
-            if hf_result:
-                logger.info("✅ Hugging Face response received.")
-                return hf_result
-
-            logger.warning("⚠️ Both Gemini and Hugging Face failed. Using fallback.")
-            return ""
-
-
-
-
+        return ""
 
     async def _call_gemini(
         self,
         prompt: str,
-        max_new_tokens: int = 1200,
-        temperature: float = 0.2,
+        max_output_tokens: int,
+        temperature: float,
     ) -> str:
-        if not self.gemini_api_key:
-            logger.warning("Gemini API key is missing.")
-            return ""
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{self.gemini_model}:generateContent?key={self.gemini_api_key}"
+        )
 
-        try:
-            url = (
-                "https://generativelanguage.googleapis.com/v1beta/"
-                "models/gemini-3-flash-preview:generateContent"
-            )
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "temperature": temperature,
+                "maxOutputTokens": max_output_tokens,
+            },
+        }
 
-            payload = {
-                "contents": [
-                    {
-                        "parts": [
-                            {
-                                "text": (
-                                    "You are a senior business analyst writing detailed FRDs.\n\n"
-                                    f"{prompt}"
-                                )
-                            }
-                        ]
-                    }
-                ],
-                "generationConfig": {
-                    "temperature": temperature,
-                    "maxOutputTokens": max_new_tokens,
-                }
-            }
+        async with httpx.AsyncClient(timeout=90) as client:
+            resp = await client.post(url, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
 
-            async with httpx.AsyncClient(timeout=120) as client:
-                response = await client.post(
-                    f"{url}?key={self.gemini_api_key}",
-                    headers={"Content-Type": "application/json"},
-                    json=payload,
-                )
-
-            if response.status_code != 200:
-                logger.warning(f"Gemini API error {response.status_code}: {response.text}")
-                return ""
-
-            data = response.json()
-
-            candidates = data.get("candidates", [])
-            if not candidates:
-                logger.warning(f"Gemini returned no candidates: {data}")
-                return ""
-
-            content = candidates[0].get("content", {})
-            parts = content.get("parts", [])
-            if not parts:
-                logger.warning(f"Gemini returned no content parts: {data}")
-                return ""
-
+        candidates = data.get("candidates", []) or []
+        for candidate in candidates:
+            content = candidate.get("content", {}) or {}
+            parts = content.get("parts", []) or []
             text_parts = [p.get("text", "") for p in parts if p.get("text")]
-            result = "\n".join(text_parts).strip()
+            if text_parts:
+                return "\n".join(text_parts).strip()
 
-            if not result:
-                logger.warning(f"Gemini returned empty text: {data}")
-                return ""
+        return ""
 
-            return result
+    async def _call_huggingface(
+        self,
+        prompt: str,
+        max_output_tokens: int,
+        temperature: float,
+    ) -> str:
+        assert self.hf_client is not None
 
-        except Exception as e:
-            logger.warning(f"Gemini call failed: {e}")
-            return ""
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a senior business analyst writing implementation-ready "
+                    "functional requirements documentation."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ]
 
-    def _parse_json_response(self, text: str) -> Optional[Dict[str, Any]]:
-        if not text:
+        completion = self.hf_client.chat_completion(
+            model=self.hf_model,
+            messages=messages,
+            max_tokens=max_output_tokens,
+            temperature=temperature,
+        )
+
+        if completion and getattr(completion, "choices", None):
+            message = completion.choices[0].message
+            if message and getattr(message, "content", None):
+                return message.content.strip()
+
+        return ""
+
+    def _parse_json_response(self, raw: str) -> Optional[Dict[str, Any]]:
+        if not raw:
             return None
 
-        text = text.strip()
-        text = re.sub(r"^```json\s*", "", text)
-        text = re.sub(r"^```\s*", "", text)
-        text = re.sub(r"\s*```$", "", text)
+        raw = raw.strip()
+
+        fenced = re.search(r"```(?:json)?\s*(\{.*\})\s*```", raw, re.DOTALL)
+        if fenced:
+            raw = fenced.group(1)
 
         try:
-            parsed = json.loads(text)
+            parsed = json.loads(raw)
             if isinstance(parsed, dict):
                 return parsed
         except Exception:
             pass
 
-        match = re.search(r"\{.*\}", text, flags=re.DOTALL)
-        if match:
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start >= 0 and end > start:
             try:
-                parsed = json.loads(match.group(0))
+                parsed = json.loads(raw[start : end + 1])
                 if isinstance(parsed, dict):
                     return parsed
             except Exception:
@@ -545,85 +542,172 @@ Source Content:
 
         return None
 
-
-    async def _call_huggingface(
-        self,
-        prompt: str,
-        max_new_tokens: int = 1200,
-        temperature: float = 0.2,
-    ) -> str:
-        if not self.hf_client or not self.hf_model:
-            logger.warning("Hugging Face client/model is not configured.")
+    def _clean_llm_output(self, text: str) -> str:
+        text = (text or "").strip()
+        if not text:
             return ""
 
-        try:
-            response = self.hf_client.chat.completions.create(
-                model=self.hf_model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are a senior business analyst writing detailed FRDs.",
-                    },
-                    {"role": "user", "content": prompt},
-                ],
-                max_tokens=max_new_tokens,
-                temperature=temperature,
-            )
+        text = re.sub(r"^```(?:markdown|md|text)?\s*", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s*```$", "", text)
+        return text.strip()
 
-            if not response or not response.choices:
-                logger.warning("Hugging Face returned no choices.")
-                return ""
+    # -------------------------------------------------------------------------
+    # Deterministic fallback generation
+    # -------------------------------------------------------------------------
 
-            content = response.choices[0].message.content
-            if not content or not content.strip():
-                logger.warning("Hugging Face returned empty content.")
-                return ""
-
-            return content.strip()
-
-        except Exception as e:
-            logger.warning(f"Hugging Face call failed: {e}")
-            return ""
-
-
-    
     def _fallback_context(
         self,
         work_item_id: int,
         documents: List[Dict[str, Any]],
         combined_source: str,
     ) -> Dict[str, Any]:
-        project_name = f"Work Item {work_item_id}"
-        client_name = "To be confirmed"
+        project_name = self._infer_project_name(documents, combined_source)
+        client_name = self._infer_client_name(combined_source)
+        business_context = self._extract_relevant_paragraphs(
+            combined_source,
+            keywords=[
+                "business",
+                "problem",
+                "current process",
+                "manual",
+                "pain point",
+                "objective",
+            ],
+            default_text=(
+                "The project aims to formalize and implement a target-state solution based on the "
+                "available presales and discovery documents. Detailed business context should be "
+                "validated during functional workshops."
+            ),
+            max_paragraphs=3,
+        )
 
-        if "we are planet" in combined_source.lower():
-            client_name = "We are Planet"
+        goals = self._unique_non_empty(
+            self._extract_bullets_by_keywords(
+                combined_source,
+                ["objective", "goal", "outcome", "benefit", "scope"],
+                limit=5,
+            )
+        ) or [
+            "Improve process efficiency and operational consistency.",
+            "Reduce manual effort, ambiguity, and dependency on informal communication.",
+            "Provide a scalable and auditable solution aligned with business needs.",
+        ]
 
-        if documents:
-            for d in documents:
-                name = d["filename"].lower()
-                if "planet" in name:
-                    project_name = "SOW for We are Planet"
+        users = self._unique_non_empty(
+            self._extract_entities_by_keywords(
+                combined_source,
+                ["user", "team", "manager", "sales", "operations", "admin", "support"],
+                limit=6,
+            )
+        ) or [
+            "Business users",
+            "Operations team",
+            "Administrators",
+        ]
+
+        roles = [
+            {
+                "role": "Business User",
+                "responsibility": "Initiates and performs day-to-day process steps in the solution.",
+            },
+            {
+                "role": "Manager / Approver",
+                "responsibility": "Reviews exceptions, approvals, and operational status.",
+            },
+            {
+                "role": "System Administrator",
+                "responsibility": "Maintains configuration, security, and reference data.",
+            },
+        ]
+
+        modules = [
+            {
+                "module_name": "Intake and Data Capture",
+                "purpose": "Capture required business inputs in a structured and validated format.",
+                "users": ["Business User"],
+                "features": [
+                    "Structured form-based entry",
+                    "Mandatory field validation",
+                    "Status tracking",
+                ],
+                "key_fields": ["Primary identifiers", "Status", "Owner", "Dates"],
+                "validations": [
+                    "Mandatory fields",
+                    "Format validation",
+                    "Duplicate checks where applicable",
+                ],
+            },
+            {
+                "module_name": "Workflow and Processing",
+                "purpose": "Route work through the required operational or approval flow.",
+                "users": ["Business User", "Manager / Approver"],
+                "features": [
+                    "Stage-based progression",
+                    "Business rule enforcement",
+                    "Exception handling",
+                ],
+                "key_fields": ["Stage", "Assignment", "Decision outcome"],
+                "validations": ["Transition rules", "Approval conditions"],
+            },
+            {
+                "module_name": "Reporting and Visibility",
+                "purpose": "Provide monitoring, auditability, and decision support.",
+                "users": ["Manager / Approver", "System Administrator"],
+                "features": [
+                    "Operational dashboards",
+                    "Search and filtering",
+                    "Audit trail visibility",
+                ],
+                "key_fields": ["Status", "Owner", "Timestamps"],
+                "validations": ["Role-based visibility"],
+            },
+        ]
 
         return {
             "project_name": project_name,
             "client_name": client_name,
-            "business_context": "To be confirmed",
-            "business_objectives": ["To be confirmed"],
-            "current_state": "To be confirmed",
-            "proposed_solution": "To be confirmed",
-            "roles": [],
-            "application_types": [],
-            "modules": [],
-            "process_flows": [],
-            "functional_requirements": [],
-            "non_functional_requirements": [],
-            "integrations": [],
-            "notifications": [],
-            "reporting_visibility": [],
-            "out_of_scope": [],
-            "assumptions_constraints": [],
-            "gaps": [],
+            "business_context": business_context,
+            "goals": goals,
+            "users": users,
+            "roles": roles,
+            "application_types": [
+                "Business application",
+                "Workflow/automation layer",
+                "Reporting/visibility layer",
+            ],
+            "modules": modules,
+            "integrations": [
+                {
+                    "system": "To be confirmed",
+                    "purpose": "Integration requirements to be finalized during detailed design.",
+                    "data_exchanged": "To be confirmed",
+                }
+            ],
+            "notifications": [
+                "Status change notifications where business action is required.",
+                "Exception or approval notifications for pending actions.",
+            ],
+            "reporting_visibility": [
+                "Operational status visibility by work item or transaction stage.",
+                "Management reporting for workload, turnaround time, and exceptions.",
+                "Audit visibility into key updates and approvals.",
+            ],
+            "out_of_scope": [
+                "Any features not explicitly supported by the approved scope documents.",
+                "Downstream enhancements that require separate discovery or design approval.",
+            ],
+            "assumptions_constraints": [
+                "Detailed field mapping and business rules will be confirmed during workshops.",
+                "Access, security roles, and integrations depend on client environment readiness.",
+            ],
+            "gaps": [
+                {
+                    "gap": "Some functional details are not fully specified in the source documents.",
+                    "proposed_solution": "Capture open points during requirement validation workshops and finalize in signed-off FRD.",
+                    "reference_section": "4.5 Functional Requirements",
+                    "phase": "Analysis",
+                }
+            ],
         }
 
     def _fallback_section(
@@ -632,168 +716,211 @@ Source Content:
         context: Dict[str, Any],
         combined_source: str,
     ) -> str:
-        project_name = context.get("project_name", "To be confirmed")
-        client_name = context.get("client_name", "To be confirmed")
-        business_context = context.get("business_context", "To be confirmed")
-        proposed_solution = context.get("proposed_solution", "To be confirmed")
+        project_name = context.get("project_name") or "To be confirmed"
+        client_name = context.get("client_name") or "To be confirmed"
+        business_context = context.get("business_context") or "To be confirmed"
 
         if section_name == "overview":
+            goals = context.get("goals") or []
+            outcomes = "\n".join([f"- {g}" for g in goals]) or "- To be confirmed"
             return (
-                f"The project '{project_name}' for client '{client_name}' aims to address the following business context: "
-                f"{business_context}. The proposed solution is intended to improve operational efficiency, process visibility, "
-                f"and service management. Detailed requirements are derived from the attached source documents."
+                f"The proposed initiative for **{project_name}** is intended to address the current "
+                f"business need identified for **{client_name}**. Based on the available discovery and "
+                f"presales material, the solution is expected to improve process control, reduce manual effort, "
+                f"and provide better operational visibility.\n\n"
+                f"**Business Context**\n{business_context}\n\n"
+                f"**Expected Business Outcomes**\n{outcomes}"
             )
 
         if section_name == "document_history":
             today = datetime.now().strftime("%Y-%m-%d")
-            return f"""| Date | Version | Description | Author |
-|---|---|---|---|
-| {today} | 1.0 | Initial auto-generated draft | FRD AI Agent |"""
+            return (
+                "| Date | Version | Description | Author |\n"
+                "|---|---|---|---|\n"
+                f"| {today} | 1.0 | Initial draft generated from source documents | FRD AI Agent |"
+            )
 
         if section_name == "current_state":
             return self._extract_relevant_paragraphs(
                 combined_source,
-                keywords=["currently", "manual", "existing", "current", "today"],
-                default_text="Current-state details are to be confirmed based on source review.",
+                ["current", "manual", "pain", "issue", "challenge", "problem", "today"],
+                (
+                    "The current-state process appears to rely on manual coordination, fragmented information, "
+                    "and limited visibility into progress and exceptions. These conditions may create delays, "
+                    "inconsistencies, and operational dependency on individuals."
+                ),
+                max_paragraphs=4,
             )
 
         if section_name == "proposed_solution":
-            return proposed_solution or self._extract_relevant_paragraphs(
-                combined_source,
-                keywords=["solution", "system", "automate", "integration", "crm"],
-                default_text="The proposed solution is to implement a system that automates and streamlines the identified business process.",
+            return (
+                "The proposed solution should provide a structured and governed business process supported by a "
+                "centralized application layer, clearly defined workflow rules, and improved operational tracking. "
+                "The future-state design should reduce ambiguity, standardize data capture, support exception handling, "
+                "and provide reporting for business stakeholders."
             )
 
         if section_name == "roles":
-            return """| Role | Responsibility |
-|---|---|
-| Support Agent | Manage and track tickets through their lifecycle |
-| Administrator | Configure system settings, security, and integrations |
-| End Customer | Raise support requests through defined channels |
-| Business Stakeholder | Review requirements and approve deliverables |"""
+            roles = context.get("roles") or []
+            lines = ["| Role | Responsibility |", "|---|---|"]
+            for role in roles:
+                lines.append(
+                    f"| {role.get('role', 'To be confirmed')} | {role.get('responsibility', 'To be confirmed')} |"
+                )
+            return "\n".join(lines)
 
         if section_name == "application_types":
-            return (
-                "The solution may include a CRM application, automation workflows, reporting/dashboard capability, "
-                "and API-based integration with the existing internal ticketing platform."
-            )
+            apps = context.get("application_types") or ["To be confirmed"]
+            return "\n".join([f"- {item}" for item in apps])
 
         if section_name == "modules_and_applications":
-            return """## Ticket Intake and Creation
-- Purpose: Capture incoming support requests
-- Users: Support Agents, System
-- Core Features: Email-to-ticket creation, ticket categorization, initial assignment
-- Key Fields / Data Points: Ticket ID, Subject, Description, Customer, Priority, Status
-- Validations / Exceptions: Duplicate email handling, missing customer data, invalid payloads
-
-## Ticket Lifecycle Management
-- Purpose: Track tickets from open to closure
-- Users: Support Agents, Supervisors
-- Core Features: Status update, reassignment, resolution notes, closure tracking
-- Key Fields / Data Points: Status, Owner, SLA dates, Resolution Summary
-- Validations / Exceptions: Mandatory resolution before closure, status transition controls
-
-## Integration Module
-- Purpose: Exchange ticket data with the internal ticketing solution
-- Users: System, Integration Admin
-- Core Features: API sync, data exchange, error logging
-- Key Fields / Data Points: External Ticket ID, Sync Status, Error Message
-- Validations / Exceptions: API failure handling, retry logic, validation of required payload fields
-"""
+            modules = context.get("modules") or []
+            parts: List[str] = []
+            for module in modules:
+                parts.append(f"### {module.get('module_name', 'To be confirmed')}")
+                parts.append(f"**Purpose:** {module.get('purpose', 'To be confirmed')}")
+                parts.append("**Users:**")
+                for user in module.get("users", []) or ["To be confirmed"]:
+                    parts.append(f"- {user}")
+                parts.append("**Core Features:**")
+                for feat in module.get("features", []) or ["To be confirmed"]:
+                    parts.append(f"- {feat}")
+                parts.append("**Key Fields / Data Points:**")
+                for field in module.get("key_fields", []) or ["To be confirmed"]:
+                    parts.append(f"- {field}")
+                parts.append("**Validations / Exceptions:**")
+                for val in module.get("validations", []) or ["To be confirmed"]:
+                    parts.append(f"- {val}")
+                parts.append("")
+            return "\n".join(parts).strip()
 
         if section_name == "process_flows":
-            return """1. Customer sends an inbound email or support request.
-2. System captures the request and creates a new ticket.
-3. Ticket is categorized and assigned to the appropriate support queue or agent.
-4. Agent reviews, updates, and progresses the ticket through defined lifecycle statuses.
-5. System synchronizes ticket data with the internal ticketing solution through API integration.
-6. Once resolved, the ticket is closed and retained for reporting and audit purposes.
-"""
+            return (
+                "1. A business user initiates a request or transaction by entering the required information.\n"
+                "2. The system validates mandatory fields and applicable business rules.\n"
+                "3. The record moves through the defined workflow stages and is routed to the appropriate owner or approver.\n"
+                "4. Exceptions or validation failures are surfaced to the user for correction or review.\n"
+                "5. Upon completion, the solution records the outcome and makes status/reporting information available to stakeholders."
+            )
 
         if section_name == "functional_requirements":
-            return """FR-001: The system shall automatically create support tickets from inbound emails.
-FR-002: The system shall assign a unique ticket identifier to each newly created ticket.
-FR-003: The system shall store ticket details including subject, description, requester, priority, and status.
-FR-004: The system shall allow support agents to update ticket status throughout the lifecycle.
-FR-005: The system shall maintain ticket history and audit information for each status change.
-FR-006: The system shall support assignment and reassignment of tickets to support users or queues.
-FR-007: The system shall integrate with the internal ticketing solution via API.
-FR-008: The system shall validate incoming requests before ticket creation.
-FR-009: The system shall restrict user actions based on role and security permissions.
-FR-010: The system shall allow users to search and view ticket records.
-FR-011: The system shall log integration failures and provide retry/error visibility.
-FR-012: The system shall support reporting on ticket lifecycle, volume, and resolution metrics.
-"""
+            reqs = [
+                "FR-001: The solution shall provide structured capture of business data required to initiate the process.",
+                "FR-002: The solution shall validate mandatory fields before allowing progression to the next stage.",
+                "FR-003: The solution shall maintain a status for each record throughout its lifecycle.",
+                "FR-004: The solution shall support assignment or routing of records to appropriate users or teams.",
+                "FR-005: The solution shall enforce business rules for stage transitions and exception handling.",
+                "FR-006: The solution shall maintain an auditable history of key updates and actions.",
+                "FR-007: The solution shall support search and retrieval of records using relevant business identifiers.",
+                "FR-008: The solution shall provide role-based access to data and actions.",
+                "FR-009: The solution shall support approval or review actions where required by the process.",
+                "FR-010: The solution shall expose operational status and pending actions to relevant stakeholders.",
+                "FR-011: The solution shall support notification triggers for significant business events.",
+                "FR-012: The solution shall support reporting and visibility into workload, progress, and exceptions.",
+            ]
+            return "\n".join(reqs)
 
         if section_name == "non_functional_requirements":
-            return """| ID | Category | Requirement |
-|---|---|---|
-| NFR-001 | Security | The system shall enforce role-based access control. |
-| NFR-002 | Compliance | The solution shall support applicable compliance requirements such as PCI DSS where stated. |
-| NFR-003 | Data Residency | The solution shall support hosting and data residency requirements within the UAE if required. |
-| NFR-004 | Availability | The system shall be available during agreed business operating hours. |
-| NFR-005 | Performance | The system shall process inbound ticket creation within acceptable operational response times. |
-| NFR-006 | Auditability | The system shall maintain audit logs for key ticket actions and updates. |
-| NFR-007 | Scalability | The solution shall support growth in ticket volume and user load. |
-"""
+            return "\n".join(
+                [
+                    "NFR-001: The solution shall enforce role-based access control for business data and actions.",
+                    "NFR-002: The solution shall maintain an audit trail for create, update, approval, and status-change activities.",
+                    "NFR-003: The solution shall provide acceptable response times for standard user actions under normal operating conditions.",
+                    "NFR-004: The solution shall support maintainable configuration of reference data and business rules where feasible.",
+                    "NFR-005: The solution shall ensure reliable processing and clear surfacing of validation or exception states.",
+                    "NFR-006: The solution shall provide usable and consistent screens, forms, and messages for business users.",
+                    "NFR-007: The solution shall support operational reporting and data visibility appropriate to user roles.",
+                    "NFR-008: The solution shall align with client security, hosting, and compliance constraints to be confirmed during design.",
+                ]
+            )
 
         if section_name == "integrations":
-            return """| System | Purpose | Data Exchanged |
-|---|---|---|
-| Internal Ticketing Solution | Synchronize ticket information | Ticket details, status, identifiers, updates |
-| Email Channel | Intake of support requests | Sender details, subject, body, attachments |
-"""
+            integrations = context.get("integrations") or []
+            lines = ["| System | Purpose | Data Exchanged |", "|---|---|---|"]
+            for item in integrations:
+                lines.append(
+                    f"| {item.get('system', 'To be confirmed')} | "
+                    f"{item.get('purpose', 'To be confirmed')} | "
+                    f"{item.get('data_exchanged', 'To be confirmed')} |"
+                )
+            return "\n".join(lines)
 
         if section_name == "notifications":
-            return (
-                "The solution should support operational notifications such as ticket assignment alerts, status change notifications, "
-                "integration failure alerts, and escalation reminders. Detailed notification rules are to be confirmed."
-            )
+            notes = context.get("notifications") or ["To be confirmed"]
+            return "\n".join([f"- {n}" for n in notes])
 
         if section_name == "reporting_visibility":
-            return (
-                "The system should provide reporting and visibility into ticket volume, aging, open vs closed tickets, resolution time, "
-                "status distribution, and agent performance. Dashboards and audit visibility should support operational monitoring."
-            )
+            items = context.get("reporting_visibility") or ["To be confirmed"]
+            return "\n".join([f"- {n}" for n in items])
 
         if section_name == "gap_analysis":
-            return """| Gap | Proposed Solution | Reference Section | Phase |
-|---|---|---|---|
-| Manual ticket intake and tracking | Automate inbound email to ticket creation and lifecycle management | Functional Requirements | Phase 1 |
-| Lack of seamless system connectivity | Introduce API integration with internal ticketing solution | Integrations | Phase 1 |
-| Limited operational visibility | Provide dashboards and reporting for ticket monitoring | Reporting / Visibility | Phase 2 |
-"""
+            gaps = context.get("gaps") or []
+            lines = [
+                "| Gap | Proposed Solution | Reference Section | Phase |",
+                "|---|---|---|---|",
+            ]
+            for item in gaps:
+                lines.append(
+                    f"| {item.get('gap', 'To be confirmed')} | "
+                    f"{item.get('proposed_solution', 'To be confirmed')} | "
+                    f"{item.get('reference_section', 'To be confirmed')} | "
+                    f"{item.get('phase', 'To be confirmed')} |"
+                )
+            return "\n".join(lines)
 
         if section_name == "out_of_scope":
-            return """- Any functionality not explicitly described in the approved requirements
-- Major changes to existing third-party platforms beyond agreed integrations
-- Commercial terms and contractual payment milestones
-- Future enhancements not included in the current delivery scope
-"""
+            items = context.get("out_of_scope") or ["To be confirmed"]
+            return "\n".join([f"- {n}" for n in items])
 
         if section_name == "assumptions_constraints":
-            return """### Assumptions
-- Required stakeholder inputs and clarifications will be provided during implementation.
-- Access to existing systems and integration endpoints will be made available by the client.
-- Business process owners will validate requirement interpretations.
-
-### Constraints
-- The solution must align with stated compliance and hosting requirements.
-- Integration feasibility depends on availability of existing system APIs.
-- Final timelines and scope may depend on business clarifications and approvals.
-"""
+            items = context.get("assumptions_constraints") or ["To be confirmed"]
+            return "\n".join([f"- {n}" for n in items])
 
         if section_name == "acceptance_signoff":
-            return """The undersigned acknowledge that this Functional Requirements Document has been reviewed and accepted for the current project phase.
-
-| Name | Role | Signature | Date |
-|---|---|---|---|
-| To be confirmed | Client Representative |  |  |
-| To be confirmed | Project Manager |  |  |
-| To be confirmed | Business Analyst |  |  |
-"""
+            return (
+                "The final FRD shall be reviewed with business and project stakeholders. "
+                "Any open points, assumptions, and unresolved decisions shall be captured before final sign-off.\n\n"
+                "| Name | Role | Signature | Date |\n"
+                "|---|---|---|---|\n"
+                "| To be confirmed | Client Representative |  |  |\n"
+                "| To be confirmed | Project Manager |  |  |\n"
+                "| To be confirmed | Business Analyst |  |  |"
+            )
 
         return "To be confirmed."
+
+    def _infer_project_name(
+        self, documents: List[Dict[str, Any]], combined_source: str
+    ) -> str:
+        for doc in documents:
+            filename = doc.get("filename", "")
+            stem = Path(filename).stem.strip()
+            if stem and len(stem) > 3:
+                return stem.replace("_", " ").replace("-", " ")
+
+        patterns = [
+            r"project\s*name\s*[:\-]\s*(.+)",
+            r"engagement\s*name\s*[:\-]\s*(.+)",
+            r"solution\s*name\s*[:\-]\s*(.+)",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, combined_source, flags=re.IGNORECASE)
+            if match:
+                return match.group(1).strip()[:120]
+
+        return "Work Item Project"
+
+    def _infer_client_name(self, combined_source: str) -> str:
+        patterns = [
+            r"client\s*name\s*[:\-]\s*(.+)",
+            r"customer\s*name\s*[:\-]\s*(.+)",
+            r"company\s*name\s*[:\-]\s*(.+)",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, combined_source, flags=re.IGNORECASE)
+            if match:
+                return match.group(1).strip()[:120]
+        return "To be confirmed"
 
     def _extract_relevant_paragraphs(
         self,
@@ -816,6 +943,48 @@ FR-012: The system shall support reporting on ticket lifecycle, volume, and reso
             return "\n\n".join(matches)
 
         return default_text
+
+    def _extract_bullets_by_keywords(
+        self,
+        text: str,
+        keywords: List[str],
+        limit: int = 5,
+    ) -> List[str]:
+        results: List[str] = []
+        lines = [line.strip(" -\t") for line in text.splitlines() if line.strip()]
+        for line in lines:
+            low = line.lower()
+            if any(k.lower() in low for k in keywords):
+                results.append(line[:220])
+            if len(results) >= limit:
+                break
+        return results
+
+    def _extract_entities_by_keywords(
+        self,
+        text: str,
+        keywords: List[str],
+        limit: int = 6,
+    ) -> List[str]:
+        results: List[str] = []
+        for line in [l.strip() for l in text.splitlines() if l.strip()]:
+            low = line.lower()
+            if any(k in low for k in keywords):
+                results.append(line[:120])
+            if len(results) >= limit:
+                break
+        return results
+
+    def _unique_non_empty(self, items: List[str]) -> List[str]:
+        seen = set()
+        result = []
+        for item in items:
+            clean = (item or "").strip()
+            key = clean.lower()
+            if clean and key not in seen:
+                seen.add(key)
+                result.append(clean)
+        return result
 
     # -------------------------------------------------------------------------
     # DOCX builder
@@ -856,14 +1025,14 @@ FR-012: The system shall support reporting on ticket lifecycle, volume, and reso
             ("Project Name", project_name),
             ("Client", client_name),
             ("Work Item ID", f"#{work_item_id}"),
-            ("Version", "1.0 — DRAFT"),
+            ("Version", "1.0 — Draft"),
             ("Status", "Auto-Generated — Pending Review"),
             ("Generated By", "FRD AI Agent"),
             ("Date", now.strftime("%B %d, %Y")),
         ]:
             row = meta.add_row().cells
             row[0].text = key
-            row[1].text = value
+            row[1].text = str(value)
 
         doc.add_paragraph("")
         doc.add_heading("Source Documents", level=2)
@@ -871,6 +1040,7 @@ FR-012: The system shall support reporting on ticket lifecycle, volume, and reso
         src_table.style = "Table Grid"
         src_table.rows[0].cells[0].text = "File Name"
         src_table.rows[0].cells[1].text = "Type"
+
         for d in documents:
             row = src_table.add_row().cells
             row[0].text = d["filename"]
@@ -895,7 +1065,7 @@ FR-012: The system shall support reporting on ticket lifecycle, volume, and reso
             ("4.7 Integrations", sections["integrations"]),
             ("4.8 Notifications", sections["notifications"]),
             ("4.9 Reporting / Visibility", sections["reporting_visibility"]),
-            ("4.10 GAP Analysis", sections["gap_analysis"]),
+            ("4.10 Gap Analysis", sections["gap_analysis"]),
             ("4.11 Out of Scope", sections["out_of_scope"]),
             ("4.12 Assumptions and Constraints", sections["assumptions_constraints"]),
             ("4.13 Acceptance / Sign-off", sections["acceptance_signoff"]),
@@ -944,7 +1114,7 @@ FR-012: The system shall support reporting on ticket lifecycle, volume, and reso
             styles["Heading 2"].font.bold = True
 
     def _add_markdownish_content(self, doc: Document, text: str) -> None:
-        lines = [line.rstrip() for line in text.splitlines()]
+        lines = [line.rstrip() for line in (text or "").splitlines()]
         i = 0
 
         while i < len(lines):
@@ -964,41 +1134,47 @@ FR-012: The system shall support reporting on ticket lifecycle, volume, and reso
                 while i < len(lines) and "|" in lines[i]:
                     table_lines.append(lines[i].strip())
                     i += 1
-                self._add_table_from_markdown(doc, table_lines)
+                self._add_markdown_table(doc, table_lines)
                 continue
 
-            if line.startswith("### "):
-                doc.add_heading(line[4:].strip(), level=3)
-                i += 1
-                continue
-
-            if line.startswith("## "):
-                doc.add_heading(line[3:].strip(), level=2)
-                i += 1
-                continue
-
-            if line.startswith("- ") or line.startswith("* "):
-                p = doc.add_paragraph(style="List Bullet")
-                p.add_run(line[2:].strip())
+            if re.match(r"^[-*]\s+", line):
+                doc.add_paragraph(re.sub(r"^[-*]\s+", "", line), style="List Bullet")
                 i += 1
                 continue
 
             if re.match(r"^\d+\.\s+", line):
-                p = doc.add_paragraph(style="List Number")
-                p.add_run(re.sub(r"^\d+\.\s+", "", line))
+                doc.add_paragraph(re.sub(r"^\d+\.\s+", "", line), style="List Number")
+                i += 1
+                continue
+
+            if line.startswith("### "):
+                doc.add_heading(line.replace("### ", "", 1), level=3)
+                i += 1
+                continue
+
+            if line.startswith("## "):
+                doc.add_heading(line.replace("## ", "", 1), level=2)
+                i += 1
+                continue
+
+            if line.startswith("# "):
+                doc.add_heading(line.replace("# ", "", 1), level=1)
                 i += 1
                 continue
 
             doc.add_paragraph(line)
             i += 1
 
-    def _add_table_from_markdown(self, doc: Document, table_lines: List[str]) -> None:
+    def _add_markdown_table(self, doc: Document, table_lines: List[str]) -> None:
+        if not table_lines:
+            return
+
         rows = []
         for line in table_lines:
-            cols = [c.strip() for c in line.strip().strip("|").split("|")]
-            rows.append(cols)
+            parts = [part.strip() for part in line.strip("|").split("|")]
+            rows.append(parts)
 
-        if not rows:
+        if len(rows) < 1:
             return
 
         header = rows[0]
@@ -1007,15 +1183,12 @@ FR-012: The system shall support reporting on ticket lifecycle, volume, and reso
         table = doc.add_table(rows=1, cols=len(header))
         table.style = "Table Grid"
 
-        hdr_cells = table.rows[0].cells
-        for idx, col in enumerate(header):
-            hdr_cells[idx].text = col
+        for idx, value in enumerate(header):
+            table.rows[0].cells[idx].text = value
 
         for row_data in body:
-            if all(
-                re.match(r"^-+$", c.replace(":", "").replace(" ", "")) for c in row_data
-            ):
+            if all(re.match(r"^[-:]+$", cell.replace(" ", "")) for cell in row_data):
                 continue
-            row_cells = table.add_row().cells
-            for idx in range(min(len(header), len(row_data))):
-                row_cells[idx].text = row_data[idx]
+            row = table.add_row().cells
+            for idx in range(min(len(row_data), len(header))):
+                row[idx].text = row_data[idx]

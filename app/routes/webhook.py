@@ -1,116 +1,208 @@
 """
 Azure DevOps Webhook Handler
-Triggers FRD generation when a Work Item is tagged as 'presales'
-Stops re-processing if an FRD is already attached
+Triggers FRD generation when a Work Item is tagged as 'presales'.
+Prevents duplicate regeneration when an FRD is already attached.
 """
 
-import logging
-from fastapi import APIRouter, Request, BackgroundTasks, HTTPException
+from __future__ import annotations
 
-from app.services.work_item_service import WorkItemService
+import logging
+from typing import Any, Dict, List
+
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
+
 from app.services.frd_generator import FRDGeneratorService
+from app.services.work_item_service import WorkItemService
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-
-def extract_tags(payload: dict) -> str:
-    resource = payload.get("resource", {})
-
-    tags = resource.get("fields", {}).get("System.Tags")
-    if tags:
-        return tags
-
-    tags = resource.get("revision", {}).get("fields", {}).get("System.Tags")
-    if tags:
-        return tags
-
-    return ""
+SUPPORTED_EVENT_TYPES = {"workitem.created", "workitem.updated"}
 
 
-@router.post("/webhook/azure-devops")
-async def handle_webhook(request: Request, background_tasks: BackgroundTasks):
-    logger.info("🔥 WEBHOOK EXECUTED")
+def _extract_tags(payload: Dict[str, Any]) -> List[str]:
+    resource = payload.get("resource", {}) or {}
 
-    try:
-        payload = await request.json()
-    except Exception:
-        logger.error("❌ Invalid JSON received", exc_info=True)
-        raise HTTPException(status_code=400, detail="Invalid JSON")
+    raw_tags = (
+        resource.get("fields", {}).get("System.Tags")
+        or resource.get("revision", {}).get("fields", {}).get("System.Tags")
+        or resource.get("tags")
+        or ""
+    )
 
-    event_type = payload.get("eventType", "")
-    resource = payload.get("resource", {})
+    if not isinstance(raw_tags, str):
+        return []
 
-    work_item_id = (
+    return [tag.strip().lower() for tag in raw_tags.split(";") if tag.strip()]
+
+
+def _extract_work_item_id(payload: Dict[str, Any]) -> int:
+    resource = payload.get("resource", {}) or {}
+
+    raw_work_item_id = (
         resource.get("workItemId")
         or resource.get("revision", {}).get("id")
         or resource.get("id")
     )
 
-    logger.info(f"📩 Event: {event_type}")
-    logger.info(f"🔢 Work Item ID: {work_item_id}")
-
-    if event_type not in ["workitem.created", "workitem.updated"]:
-        logger.warning("⛔ Ignored event type")
-        return {"status": "ignored", "reason": "event not supported"}
-
-    if not work_item_id:
-        logger.error("❌ Work Item ID missing")
+    if raw_work_item_id is None:
         raise HTTPException(status_code=400, detail="Missing Work Item ID")
 
-    tags = extract_tags(payload)
-    logger.info(f"🏷️ Tags: {tags}")
+    try:
+        return int(raw_work_item_id)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="Invalid Work Item ID") from exc
 
-    is_presales = "presales" in tags.lower()
-    if not is_presales:
-        logger.warning("⛔ Not a presales item")
-        return {"status": "ignored", "reason": "no presales tag"}
 
-    logger.info(f"✅ Presales detected for Work Item #{work_item_id}")
+def _is_supported_event(payload: Dict[str, Any]) -> bool:
+    event_type = (payload.get("eventType") or "").strip().lower()
+    return event_type in SUPPORTED_EVENT_TYPES
 
-    background_tasks.add_task(process_frd_pipeline, int(work_item_id))
+
+def _is_likely_self_update(payload: Dict[str, Any]) -> bool:
+    resource = payload.get("resource", {}) or {}
+    revision_fields = resource.get("revision", {}).get("fields", {}) or {}
+    changed_fields = resource.get("fields", {}) or {}
+
+    for field_map in (revision_fields, changed_fields):
+        for value in field_map.values():
+            if isinstance(value, str) and "auto-generated frd" in value.lower():
+                return True
+
+    return False
+
+
+@router.post("/webhook/azure-devops")
+async def handle_webhook(request: Request, background_tasks: BackgroundTasks):
+    request_id = request.headers.get("x-request-id") or request.headers.get(
+        "x-ms-request-id"
+    )
+
+    logger.info("Webhook received | request_id=%s", request_id)
+
+    try:
+        payload = await request.json()
+    except Exception as exc:
+        logger.exception(
+            "Invalid webhook JSON | request_id=%s | error=%s", request_id, exc
+        )
+        raise HTTPException(status_code=400, detail="Invalid JSON") from exc
+
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Invalid payload format")
+
+    event_type = (payload.get("eventType") or "").strip().lower()
+    logger.info("Webhook event | request_id=%s | event_type=%s", request_id, event_type)
+
+    if not _is_supported_event(payload):
+        logger.info(
+            "Ignoring unsupported event | request_id=%s | event_type=%s",
+            request_id,
+            event_type,
+        )
+        return {"status": "ignored", "reason": "unsupported_event"}
+
+    if _is_likely_self_update(payload):
+        logger.info("Ignoring likely self-update | request_id=%s", request_id)
+        return {"status": "ignored", "reason": "self_update"}
+
+    work_item_id = _extract_work_item_id(payload)
+    tags = _extract_tags(payload)
+
+    logger.info(
+        "Webhook parsed | request_id=%s | work_item_id=%s | tags=%s",
+        request_id,
+        work_item_id,
+        tags,
+    )
+
+    if "presales" not in tags:
+        logger.info(
+            "Ignoring non-presales work item | request_id=%s | work_item_id=%s",
+            request_id,
+            work_item_id,
+        )
+        return {"status": "ignored", "reason": "missing_presales_tag"}
+
+    background_tasks.add_task(process_frd_pipeline, work_item_id, request_id)
 
     return {
         "status": "accepted",
-        "message": f"FRD generation started for Work Item {work_item_id}",
+        "message": f"FRD generation queued for Work Item {work_item_id}",
+        "work_item_id": work_item_id,
     }
 
 
-async def process_frd_pipeline(work_item_id: int):
-    logger.error(f"🚀 PIPELINE STARTED for WI {work_item_id}")
+async def process_frd_pipeline(
+    work_item_id: int, request_id: str | None = None
+) -> None:
+    logger.info(
+        "FRD pipeline started | request_id=%s | work_item_id=%s",
+        request_id,
+        work_item_id,
+    )
+
+    work_item_service = WorkItemService()
+    frd_generator = FRDGeneratorService()
 
     try:
-        work_item_service = WorkItemService()
-        frd_generator = FRDGeneratorService()
-
-        # STOP LOOP: if FRD already exists, do nothing
         already_exists = await work_item_service.has_generated_frd(work_item_id)
+        logger.info(
+            "Existing FRD check complete | request_id=%s | work_item_id=%s | already_exists=%s",
+            request_id,
+            work_item_id,
+            already_exists,
+        )
+
         if already_exists:
-            logger.warning(
-                f"⏭️ FRD already exists for WI {work_item_id}. Skipping regeneration."
+            logger.info(
+                "Skipping generation because FRD already exists | request_id=%s | work_item_id=%s",
+                request_id,
+                work_item_id,
             )
             return
 
-        logger.error("📄 Fetching documents...")
         documents = await work_item_service.fetch_work_item_documents(work_item_id)
-
-        logger.error(f"📎 Documents fetched: {len(documents)}")
-
-        if not documents:
-            logger.error("❌ NO DOCUMENTS FOUND - STOPPING")
-            return
-
-        logger.error("🤖 Generating FRD...")
-        frd_path = await frd_generator.generate_frd(
-            work_item_id=work_item_id, documents=documents
+        logger.info(
+            "Documents fetched | request_id=%s | work_item_id=%s | count=%s",
+            request_id,
+            work_item_id,
+            len(documents),
         )
 
-        logger.error(f"📄 FRD GENERATED: {frd_path}")
+        if not documents:
+            logger.warning(
+                "No usable documents found; skipping generation | request_id=%s | work_item_id=%s",
+                request_id,
+                work_item_id,
+            )
+            return
 
-        logger.error("📤 Uploading to Azure DevOps...")
+        frd_path = await frd_generator.generate_frd(
+            work_item_id=work_item_id,
+            documents=documents,
+        )
+
+        logger.info(
+            "FRD generated | request_id=%s | work_item_id=%s | path=%s",
+            request_id,
+            work_item_id,
+            frd_path,
+        )
+
         await work_item_service.upload_frd_to_work_item(work_item_id, frd_path)
 
-        logger.error("✅ PIPELINE COMPLETED SUCCESSFULLY")
+        logger.info(
+            "FRD pipeline completed successfully | request_id=%s | work_item_id=%s",
+            request_id,
+            work_item_id,
+        )
 
-    except Exception:
-        logger.error("🔥🔥🔥 PIPELINE CRASHED 🔥🔥🔥", exc_info=True)
+    except Exception as exc:
+        logger.exception(
+            "FRD pipeline failed | request_id=%s | work_item_id=%s | error=%s",
+            request_id,
+            work_item_id,
+            exc,
+        )
+        raise

@@ -12,6 +12,7 @@ from app.utils.document_extractor import DocumentExtractor
 class TestPresalesTagDetection:
     def setup_method(self):
         import os
+
         os.environ.setdefault("ADO_ORG_URL", "https://dev.azure.com/test")
         os.environ.setdefault("ADO_PROJECT", "test")
         os.environ.setdefault("ADO_PAT", "test")
@@ -61,6 +62,7 @@ class TestDocumentExtractor:
     def test_document_classification(self):
         from app.services.work_item_service import WorkItemService
         import os
+
         os.environ.setdefault("ADO_ORG_URL", "https://dev.azure.com/test")
         os.environ.setdefault("ADO_PROJECT", "test")
         os.environ.setdefault("ADO_PAT", "test")

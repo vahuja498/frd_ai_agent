@@ -83,8 +83,15 @@ class WorkItemService:
                 f"{self.org_url}/{settings.ADO_PROJECT_ENCODED}/_apis/wit/workitems/{work_item_id}"
                 f"?$expand=relations&api-version=7.1"
             )
-            resp = await client.get(wi_url, headers=self._auth_header)
-            resp.raise_for_status()
+            try:
+                resp = await client.get(wi_url)
+                print("STATUS:", resp.status_code)
+                print("RESPONSE:", resp.text)  # 🔥 VERY IMPORTANT
+                resp.raise_for_status()
+            except Exception as e:
+                print("ERROR:", str(e))
+                raise
+
             work_item = resp.json()
 
             relations = work_item.get("relations", [])

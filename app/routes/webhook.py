@@ -20,20 +20,30 @@ router = APIRouter()
 SUPPORTED_EVENT_TYPES = {"workitem.created", "workitem.updated"}
 
 
-def _extract_tags(payload: Dict[str, Any]) -> List[str]:
+def _extract_tags(payload: dict) -> list[str]:
     resource = payload.get("resource", {}) or {}
 
-    raw_tags = (
-        resource.get("fields", {}).get("System.Tags")
-        or resource.get("revision", {}).get("fields", {}).get("System.Tags")
-        or resource.get("tags")
-        or ""
-    )
+    possible_sources = [
+        resource.get("fields", {}).get("System.Tags"),
+        resource.get("revision", {}).get("fields", {}).get("System.Tags"),
+        resource.get("tags"),
+    ]
 
-    if not isinstance(raw_tags, str):
-        return []
+    for tags in possible_sources:
+        if not tags:
+            continue
 
-    return [tag.strip().lower() for tag in raw_tags.split(";") if tag.strip()]
+        # CASE 1: direct string
+        if isinstance(tags, str):
+            return [t.strip().lower() for t in tags.split(";") if t.strip()]
+
+        # CASE 2: change object (oldValue/newValue)
+        if isinstance(tags, dict):
+            new_val = tags.get("newValue") or tags.get("oldValue")
+            if isinstance(new_val, str):
+                return [t.strip().lower() for t in new_val.split(";") if t.strip()]
+
+    return []
 
 
 def _extract_work_item_id(payload: Dict[str, Any]) -> int:

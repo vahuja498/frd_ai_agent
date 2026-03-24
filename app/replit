@@ -1,0 +1,10 @@
+run = "bash start.sh"
+
+[env]
+PYTHONPATH = "."
+
+[nix]
+channel = "stable-23_11"
+
+[deployment]
+run = ["sh", "-c", "bash start.sh"]

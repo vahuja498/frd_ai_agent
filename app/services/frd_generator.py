@@ -411,30 +411,111 @@ Source Content:
 
         return self._fallback_section(section_name, context, combined_source)
 
-    async def _call_model(
+        async def _call_model(
+            self,
+            prompt: str,
+            max_new_tokens: int = 1200,
+            temperature: float = 0.2,
+        ) -> str:
+            gemini_result = await self._call_gemini(
+                prompt=prompt,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+            )
+            if gemini_result:
+                logger.info("✅ Gemini response received.")
+                return gemini_result
+
+            logger.warning(
+                "⚠️ Gemini failed or returned empty output. Trying Hugging Face..."
+            )
+
+            hf_result = await self._call_huggingface(
+                prompt=prompt,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+            )
+            if hf_result:
+                logger.info("✅ Hugging Face response received.")
+                return hf_result
+
+            logger.warning("⚠️ Both Gemini and Hugging Face failed. Using fallback.")
+            return ""
+
+
+
+
+
+    async def _call_gemini(
         self,
         prompt: str,
         max_new_tokens: int = 1200,
         temperature: float = 0.2,
     ) -> str:
+        if not self.gemini_api_key:
+            logger.warning("Gemini API key is missing.")
+            return ""
+
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are a senior business analyst writing detailed FRDs.",
-                    },
-                    {"role": "user", "content": prompt},
-                ],
-                max_tokens=max_new_tokens,
-                temperature=temperature,
+            url = (
+                "https://generativelanguage.googleapis.com/v1beta/"
+                "models/gemini-3-flash-preview:generateContent"
             )
 
-            return response.choices[0].message.content.strip()
+            payload = {
+                "contents": [
+                    {
+                        "parts": [
+                            {
+                                "text": (
+                                    "You are a senior business analyst writing detailed FRDs.\n\n"
+                                    f"{prompt}"
+                                )
+                            }
+                        ]
+                    }
+                ],
+                "generationConfig": {
+                    "temperature": temperature,
+                    "maxOutputTokens": max_new_tokens,
+                }
+            }
+
+            async with httpx.AsyncClient(timeout=120) as client:
+                response = await client.post(
+                    f"{url}?key={self.gemini_api_key}",
+                    headers={"Content-Type": "application/json"},
+                    json=payload,
+                )
+
+            if response.status_code != 200:
+                logger.warning(f"Gemini API error {response.status_code}: {response.text}")
+                return ""
+
+            data = response.json()
+
+            candidates = data.get("candidates", [])
+            if not candidates:
+                logger.warning(f"Gemini returned no candidates: {data}")
+                return ""
+
+            content = candidates[0].get("content", {})
+            parts = content.get("parts", [])
+            if not parts:
+                logger.warning(f"Gemini returned no content parts: {data}")
+                return ""
+
+            text_parts = [p.get("text", "") for p in parts if p.get("text")]
+            result = "\n".join(text_parts).strip()
+
+            if not result:
+                logger.warning(f"Gemini returned empty text: {data}")
+                return ""
+
+            return result
 
         except Exception as e:
-            logger.warning(f"HuggingFace call failed, using fallback: {e}")
+            logger.warning(f"Gemini call failed: {e}")
             return ""
 
     def _parse_json_response(self, text: str) -> Optional[Dict[str, Any]]:
@@ -464,6 +545,48 @@ Source Content:
 
         return None
 
+
+    async def _call_huggingface(
+        self,
+        prompt: str,
+        max_new_tokens: int = 1200,
+        temperature: float = 0.2,
+    ) -> str:
+        if not self.hf_client or not self.hf_model:
+            logger.warning("Hugging Face client/model is not configured.")
+            return ""
+
+        try:
+            response = self.hf_client.chat.completions.create(
+                model=self.hf_model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are a senior business analyst writing detailed FRDs.",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=max_new_tokens,
+                temperature=temperature,
+            )
+
+            if not response or not response.choices:
+                logger.warning("Hugging Face returned no choices.")
+                return ""
+
+            content = response.choices[0].message.content
+            if not content or not content.strip():
+                logger.warning("Hugging Face returned empty content.")
+                return ""
+
+            return content.strip()
+
+        except Exception as e:
+            logger.warning(f"Hugging Face call failed: {e}")
+            return ""
+
+
+    
     def _fallback_context(
         self,
         work_item_id: int,

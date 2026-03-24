@@ -45,7 +45,11 @@ class FRDGeneratorService:
     # ──────────────────────────────────────────────
 
     async def generate_frd(
-        self, work_item_id: int, documents: List[WorkItemDocument]
+        self,
+        work_item_id: int,
+        documents: List[WorkItemDocument],
+        project_name: str = "Untitled Project",
+        client_name: str = "",
     ) -> Path:
         """
         Orchestrates FRD generation:
@@ -57,7 +61,9 @@ class FRDGeneratorService:
         logger.info(f"Context length: {len(context)} chars")
 
         sections = await self._generate_frd_sections(context, work_item_id)
-        docx_path = self._render_docx(work_item_id, sections, documents)
+        docx_path = self._render_docx(
+            work_item_id, sections, documents, project_name, client_name
+        )
         return docx_path
 
     # ──────────────────────────────────────────────
@@ -84,9 +90,7 @@ class FRDGeneratorService:
     # LLM Section Generator
     # ──────────────────────────────────────────────
 
-    async def _generate_frd_sections(
-        self, context: str, work_item_id: int
-    ) -> dict:
+    async def _generate_frd_sections(self, context: str, work_item_id: int) -> dict:
         """Generate each FRD section via HuggingFace LLM."""
         section_prompts = {
             "project_overview": self._prompt_project_overview(context),
@@ -106,8 +110,12 @@ class FRDGeneratorService:
             try:
                 results[section_key] = await self._call_llm(prompt)
             except Exception as e:
-                logger.warning(f"LLM failed for section {section_key}: {e}. Using placeholder.")
-                results[section_key] = f"[Content could not be generated. Please review source documents.]"
+                logger.warning(
+                    f"LLM failed for section {section_key}: {e}. Using placeholder."
+                )
+                results[section_key] = (
+                    f"[Content could not be generated. Please review source documents.]"
+                )
 
         return results
 
@@ -131,6 +139,7 @@ class FRDGeneratorService:
             # Handle model loading (HF free tier may cold-start)
             if resp.status_code == 503:
                 import asyncio
+
                 logger.info("Model loading on HuggingFace, waiting 30s...")
                 await asyncio.sleep(30)
                 resp = await client.post(url, headers=self._headers, json=payload)
@@ -168,7 +177,9 @@ class FRDGeneratorService:
 
     def _prompt_project_overview(self, ctx: str) -> str:
         return (
-            self._sys("a senior business analyst writing a Functional Requirements Document")
+            self._sys(
+                "a senior business analyst writing a Functional Requirements Document"
+            )
             + f"Based on the following source documents, write a professional PROJECT OVERVIEW section "
             f"for an FRD. Include: project name, background, purpose, and high-level description.\n\n"
             f"SOURCE DOCUMENTS:\n{ctx[:3000]}\n\nPROJECT OVERVIEW:[/INST]"
@@ -243,14 +254,19 @@ class FRDGeneratorService:
     # ──────────────────────────────────────────────
 
     def _render_docx(
-        self, work_item_id: int, sections: dict, documents: List[WorkItemDocument]
+        self,
+        work_item_id: int,
+        sections: dict,
+        documents: List[WorkItemDocument],
+        project_name: str = "Untitled Project",
+        client_name: str = "",
     ) -> Path:
         """Renders a professional FRD Word document."""
         doc = Document()
         self._configure_document(doc)
 
         # Cover Page
-        self._add_cover_page(doc, work_item_id, documents)
+        self._add_cover_page(doc, work_item_id, documents, project_name, client_name)
 
         # Table of Contents placeholder
         self._add_toc(doc)
@@ -262,8 +278,14 @@ class FRDGeneratorService:
             ("3. Scope", sections.get("scope", "")),
             ("4. Stakeholders", sections.get("stakeholders", "")),
             ("5. Functional Requirements", sections.get("functional_requirements", "")),
-            ("6. Non-Functional Requirements", sections.get("non_functional_requirements", "")),
-            ("7. Assumptions & Constraints", sections.get("assumptions_constraints", "")),
+            (
+                "6. Non-Functional Requirements",
+                sections.get("non_functional_requirements", ""),
+            ),
+            (
+                "7. Assumptions & Constraints",
+                sections.get("assumptions_constraints", ""),
+            ),
             ("8. Risks & Dependencies", sections.get("risks", "")),
             ("9. Glossary", sections.get("glossary", "")),
             ("10. Source Documents", self._format_source_list(documents)),
@@ -275,7 +297,10 @@ class FRDGeneratorService:
         # Footer
         self._add_footer(doc, work_item_id)
 
-        output_path = OUTPUT_DIR / f"FRD_WI{work_item_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx"
+        output_path = (
+            OUTPUT_DIR
+            / f"FRD_WI{work_item_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx"
+        )
         doc.save(output_path)
         logger.info(f"📄 FRD saved: {output_path}")
         return output_path
@@ -283,6 +308,7 @@ class FRDGeneratorService:
     def _configure_document(self, doc: Document):
         """Set document margins and default styles."""
         from docx.shared import Cm
+
         section = doc.sections[0]
         section.top_margin = Cm(2.5)
         section.bottom_margin = Cm(2.5)
@@ -293,7 +319,14 @@ class FRDGeneratorService:
         style.font.name = "Calibri"
         style.font.size = Pt(11)
 
-    def _add_cover_page(self, doc: Document, work_item_id: int, documents: List[WorkItemDocument]):
+    def _add_cover_page(
+        self,
+        doc: Document,
+        work_item_id: int,
+        documents: List[WorkItemDocument],
+        project_name: str = "Untitled Project",
+        client_name: str = "",
+    ):
         """Create a professional cover page."""
         doc.add_paragraph()
         doc.add_paragraph()
@@ -309,18 +342,28 @@ class FRDGeneratorService:
 
         sub_para = doc.add_paragraph()
         sub_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        sub_run = sub_para.add_run(f"Work Item #{work_item_id} — Pre-Sales Analysis")
-        sub_run.font.size = Pt(14)
+        sub_run = sub_para.add_run(project_name)
+        sub_run.font.size = Pt(16)
+        sub_run.font.bold = True
         sub_run.font.color.rgb = RGBColor(0x40, 0x40, 0x40)
 
         doc.add_paragraph()
 
         meta = [
             ("Document Type", "Functional Requirements Document (FRD)"),
+            ("Project Name", project_name),
+            ("Client", client_name or "Not specified"),
+            ("Work Item ID", f"#{work_item_id}" if work_item_id else "N/A"),
             ("Status", "DRAFT — Auto-Generated"),
             ("Generated By", "FRD AI Agent"),
             ("Date", datetime.now().strftime("%B %d, %Y")),
-            ("Source Documents", ", ".join(d.filename for d in documents) or "N/A"),
+            (
+                "Source Documents",
+                ", ".join(
+                    d.filename for d in documents if d.filename != "__metadata__.txt"
+                )
+                or "N/A",
+            ),
         ]
 
         table = doc.add_table(rows=len(meta), cols=2)
@@ -401,5 +444,7 @@ class FRDGeneratorService:
             return "No source documents were attached."
         lines = []
         for doc in documents:
-            lines.append(f"- {doc.filename} (Type: {doc.doc_type.upper()}, {len(doc.content)} chars extracted)")
+            lines.append(
+                f"- {doc.filename} (Type: {doc.doc_type.upper()}, {len(doc.content)} chars extracted)"
+            )
         return "\n".join(lines)

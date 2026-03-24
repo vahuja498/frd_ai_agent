@@ -35,6 +35,38 @@ class WorkItemService:
             "Content-Type": "application/json",
         }
 
+    async def has_generated_frd(self, work_item_id: int) -> bool:
+        """
+        Returns True if an auto-generated FRD is already attached to the work item.
+        This prevents infinite webhook loops.
+        """
+        async with httpx.AsyncClient(timeout=60) as client:
+            wi_url = (
+                f"{self.org_url}/{settings.ADO_PROJECT_ENCODED}/_apis/wit/workitems/{work_item_id}"
+                f"?$expand=relations&api-version=7.1"
+            )
+
+            resp = await client.get(wi_url, headers=self._auth_header)
+            resp.raise_for_status()
+
+            work_item = resp.json()
+
+            for rel in work_item.get("relations", []):
+                if rel.get("rel") != "AttachedFile":
+                    continue
+
+                attrs = rel.get("attributes", {})
+                name = (attrs.get("name") or "").lower()
+                comment = (attrs.get("comment") or "").lower()
+
+                if "frd" in name:
+                    return True
+
+                if "auto-generated frd" in comment:
+                    return True
+
+        return False
+
     def is_presales_tagged(self, payload: AzureDevOpsWebhookPayload) -> bool:
         """
         Checks whether the Work Item payload contains the 'presales' tag.

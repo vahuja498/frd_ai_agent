@@ -24,3 +24,5 @@ externalPort = 80
 GEMINI_API_KEY = ""
 HF_MODEL = "mistralai/Mistral-7B-Instruct-v0.2"
 GEMINI_MODEL = "gemini-3-flash-preview"
+localPort = 8080
+externalPort = 80

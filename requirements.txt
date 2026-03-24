@@ -16,3 +16,4 @@ PyPDF2==3.0.1
 
 # Utilities
 python-multipart==0.0.9
+huggingface_hub==0.24.6

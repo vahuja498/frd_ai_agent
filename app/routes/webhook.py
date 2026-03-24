@@ -15,8 +15,8 @@ from app.utils.signature_validator import validate_webhook_signature
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-work_item_service = WorkItemService()
-frd_generator = FRDGeneratorService()
+
+
 
 
 @router.post("/webhook/azure-devops")
@@ -55,6 +55,7 @@ async def handle_azure_devops_webhook(
         return {"status": "ignored", "reason": "Event type not relevant"}
 
     # Check if the work item is tagged as 'presales'
+    work_item_service = WorkItemService()
     is_presales = work_item_service.is_presales_tagged(payload)
 
     if not is_presales:

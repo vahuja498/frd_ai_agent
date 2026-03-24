@@ -1,0 +1,26 @@
+modules = ["python-3.12"]
+[agent]
+expertMode = true
+
+[nix]
+channel = "stable-25_05"
+packages = ["libxcrypt"]
+
+[deployment]
+run = ["sh", "-c", "bash start.sh"]
+deploymentTarget = "cloudrun"
+
+[[ports]]
+localPort = 8000
+externalPort = 8000
+
+[[ports]]
+localPort = 8080
+externalPort = 80
+
+[userenv]
+
+[userenv.shared]
+GEMINI_API_KEY = ""
+HF_MODEL = "mistralai/Mistral-7B-Instruct-v0.2"
+GEMINI_MODEL = "gemini-3-flash-preview"

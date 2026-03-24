@@ -22,28 +22,29 @@ from docx import Document
 from docx.enum.table import WD_TABLE_ALIGNMENT
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.shared import Inches, Pt
-from huggingface_hub import InferenceClient
 
 from app.config import settings
 
 logger = logging.getLogger(__name__)
 
+from huggingface_hub import InferenceClient
+
 
 class FRDGeneratorService:
     def __init__(self) -> None:
-        # Primary provider: Gemini
-        self.gemini_api_key = settings.GEMINI_API_KEY
-        self.gemini_model = getattr(settings, "GEMINI_MODEL", "gemini-3-flash-preview")
-
-        # Secondary provider: Hugging Face
         self.hf_token = settings.HF_API_TOKEN
-        self.hf_model = settings.HF_MODEL
-        self.hf_client = (
-            InferenceClient(api_key=self.hf_token) if self.hf_token else None
-        )
+        self.model = settings.HF_MODEL
 
         self.output_dir = Path(settings.OUTPUT_DIR)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        self.client = InferenceClient(api_key=self.hf_token)
+
+        self.api_url = f"https://api-inference.huggingface.co/models/{self.model}"
+        self.http_headers = {
+            "Authorization": f"Bearer {self.hf_token}",
+            "Content-Type": "application/json",
+        }
 
     async def generate_frd(self, work_item_id: int, documents: List[Any]) -> Path:
         if not documents:
@@ -52,14 +53,14 @@ class FRDGeneratorService:
         normalized_docs = self._normalize_documents(documents)
         combined_source = self._combine_documents(normalized_docs)
 
-        logger.warning("🧠 Extracting structured project context...")
+        logger.info("🧠 Extracting structured project context...")
         context = await self._extract_project_context(
             work_item_id=work_item_id,
             combined_source=combined_source,
             documents=normalized_docs,
         )
 
-        logger.warning("📝 Generating FRD sections...")
+        logger.info("📝 Generating FRD sections...")
         section_names = [
             "overview",
             "document_history",
@@ -89,7 +90,7 @@ class FRDGeneratorService:
                 combined_source=combined_source,
             )
 
-        logger.warning("📄 Building DOCX...")
+        logger.info("📄 Building DOCX...")
         output_path = self._build_docx(
             work_item_id=work_item_id,
             context=context,
@@ -97,7 +98,7 @@ class FRDGeneratorService:
             sections=sections,
         )
 
-        logger.warning(f"✅ FRD generated at {output_path}")
+        logger.info(f"✅ FRD generated at {output_path}")
         return output_path
 
     # -------------------------------------------------------------------------
@@ -410,36 +411,40 @@ Source Content:
 
         return self._fallback_section(section_name, context, combined_source)
 
-    async def _call_model(
-        self,
-        prompt: str,
-        max_new_tokens: int = 1200,
-        temperature: float = 0.2,
-    ) -> str:
-        gemini_result = await self._call_gemini(
-            prompt=prompt,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-        )
-        if gemini_result:
-            logger.warning("✅ Gemini response received.")
-            return gemini_result
+        async def _call_model(
+            self,
+            prompt: str,
+            max_new_tokens: int = 1200,
+            temperature: float = 0.2,
+        ) -> str:
+            gemini_result = await self._call_gemini(
+                prompt=prompt,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+            )
+            if gemini_result:
+                logger.info("✅ Gemini response received.")
+                return gemini_result
 
-        logger.warning(
-            "⚠️ Gemini failed or returned empty output. Trying Hugging Face..."
-        )
+            logger.warning(
+                "⚠️ Gemini failed or returned empty output. Trying Hugging Face..."
+            )
 
-        hf_result = await self._call_huggingface(
-            prompt=prompt,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-        )
-        if hf_result:
-            logger.warning("✅ Hugging Face response received.")
-            return hf_result
+            hf_result = await self._call_huggingface(
+                prompt=prompt,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+            )
+            if hf_result:
+                logger.info("✅ Hugging Face response received.")
+                return hf_result
 
-        logger.warning("⚠️ Both Gemini and Hugging Face failed. Using fallback.")
-        return ""
+            logger.warning("⚠️ Both Gemini and Hugging Face failed. Using fallback.")
+            return ""
+
+
+
+
 
     async def _call_gemini(
         self,
@@ -454,7 +459,7 @@ Source Content:
         try:
             url = (
                 "https://generativelanguage.googleapis.com/v1beta/"
-                f"models/{self.gemini_model}:generateContent"
+                "models/gemini-3-flash-preview:generateContent"
             )
 
             payload = {
@@ -473,7 +478,7 @@ Source Content:
                 "generationConfig": {
                     "temperature": temperature,
                     "maxOutputTokens": max_new_tokens,
-                },
+                }
             }
 
             async with httpx.AsyncClient(timeout=120) as client:
@@ -484,9 +489,7 @@ Source Content:
                 )
 
             if response.status_code != 200:
-                logger.warning(
-                    f"Gemini API error {response.status_code}: {response.text}"
-                )
+                logger.warning(f"Gemini API error {response.status_code}: {response.text}")
                 return ""
 
             data = response.json()
@@ -514,6 +517,34 @@ Source Content:
         except Exception as e:
             logger.warning(f"Gemini call failed: {e}")
             return ""
+
+    def _parse_json_response(self, text: str) -> Optional[Dict[str, Any]]:
+        if not text:
+            return None
+
+        text = text.strip()
+        text = re.sub(r"^```json\s*", "", text)
+        text = re.sub(r"^```\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+
+        match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+        if match:
+            try:
+                parsed = json.loads(match.group(0))
+                if isinstance(parsed, dict):
+                    return parsed
+            except Exception:
+                return None
+
+        return None
+
 
     async def _call_huggingface(
         self,
@@ -554,33 +585,8 @@ Source Content:
             logger.warning(f"Hugging Face call failed: {e}")
             return ""
 
-    def _parse_json_response(self, text: str) -> Optional[Dict[str, Any]]:
-        if not text:
-            return None
 
-        text = text.strip()
-        text = re.sub(r"^```json\s*", "", text)
-        text = re.sub(r"^```\s*", "", text)
-        text = re.sub(r"\s*```$", "", text)
-
-        try:
-            parsed = json.loads(text)
-            if isinstance(parsed, dict):
-                return parsed
-        except Exception:
-            pass
-
-        match = re.search(r"\{.*\}", text, flags=re.DOTALL)
-        if match:
-            try:
-                parsed = json.loads(match.group(0))
-                if isinstance(parsed, dict):
-                    return parsed
-            except Exception:
-                return None
-
-        return None
-
+    
     def _fallback_context(
         self,
         work_item_id: int,

@@ -23,6 +23,8 @@ class Settings(BaseSettings):
     # Primary LLM: Gemini
     GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
     GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-3-flash-preview")
+
+    # Secondary LLM: Hugging Face
     HF_API_TOKEN: str = os.getenv("HF_API_TOKEN", "")
     HF_MODEL: str = os.getenv("HF_MODEL", "mistralai/Mistral-7B-Instruct-v0.2")
 

@@ -53,7 +53,14 @@ async def handle_webhook(request: Request, background_tasks: BackgroundTasks):
     event_type = payload.get("eventType", "")
     resource = payload.get("resource", {})
 
-    work_item_id = resource.get("id") or resource.get("workItemId")
+    work_item_id = resource.get("workItemId")
+    if not work_item_id:
+        revision = resource.get("revision", {})
+        work_item_id = revision.get("id")
+
+    if not work_item_id:
+        logger.error("❌ Work Item ID missing")
+        raise HTTPException(status_code=400, detail="Missing Work Item ID")
 
     logger.info(f"📩 Event: {event_type}")
     logger.info(f"🔢 Work Item ID: {work_item_id}")

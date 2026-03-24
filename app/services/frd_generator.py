@@ -437,32 +437,39 @@ Source Content:
             },
         }
 
-        async with httpx.AsyncClient(timeout=180) as client:
-            response = await client.post(
-                self.api_url,
-                headers=self.http_headers,
-                json=payload,
-            )
+        try:
+            async with httpx.AsyncClient(timeout=180) as client:
+                response = await client.post(
+                    self.api_url,
+                    headers=self.http_headers,
+                    json=payload,
+                )
 
-        response.raise_for_status()
-        data = response.json()
+            # ✅ Safe handling
+            if response.status_code in (404, 410, 503):
+                logger.warning(
+                    f"HuggingFace model unavailable ({response.status_code})"
+                )
+                return ""
 
-        # Common HF text-gen response shapes
-        if isinstance(data, list) and data:
-            first = data[0]
-            if isinstance(first, dict):
-                if "generated_text" in first:
-                    return str(first["generated_text"]).strip()
-                if "summary_text" in first:
-                    return str(first["summary_text"]).strip()
+            response.raise_for_status()
+            data = response.json()
 
-        if isinstance(data, dict):
-            if "generated_text" in data:
-                return str(data["generated_text"]).strip()
-            if "error" in data:
-                raise RuntimeError(f"Hugging Face inference error: {data['error']}")
+            if isinstance(data, list) and data:
+                first = data[0]
+                if isinstance(first, dict):
+                    if "generated_text" in first:
+                        return str(first["generated_text"]).strip()
 
-        return str(data).strip()
+            if isinstance(data, dict):
+                if "generated_text" in data:
+                    return str(data["generated_text"]).strip()
+
+            return ""
+
+        except Exception as e:
+            logger.warning(f"LLM call failed: {e}")
+            return ""
 
     def _parse_json_response(self, text: str) -> Optional[Dict[str, Any]]:
         if not text:

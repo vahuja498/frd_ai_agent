@@ -94,32 +94,44 @@ async def handle_webhook(request: Request, background_tasks: BackgroundTasks):
 # 🤖 Background FRD Pipeline
 # -------------------------------
 async def process_frd_pipeline(work_item_id: int):
-    work_item_service = WorkItemService()
-    frd_generator = FRDGeneratorService()
+    logger.error(f"🚀 PIPELINE STARTED for WI {work_item_id}")
 
     try:
-        logger.info(f"📄 Fetching documents for WI #{work_item_id}")
+        work_item_service = WorkItemService()
+        frd_generator = FRDGeneratorService()
 
+        # -------------------------------
+        # STEP 1: Fetch documents
+        # -------------------------------
+        logger.error("📄 Fetching documents...")
         documents = await work_item_service.fetch_work_item_documents(work_item_id)
-        logger.info(f"📎 Documents fetched: {len(documents)}")
+
+        logger.error(f"📎 Documents fetched: {documents}")
 
         if not documents:
-            logger.warning("⚠️ No attachments found. Skipping FRD generation.")
+            logger.error("❌ NO DOCUMENTS FOUND - STOPPING")
             return
 
-        logger.info("🤖 Generating FRD...")
-
+        # -------------------------------
+        # STEP 2: Generate FRD
+        # -------------------------------
+        logger.error("🤖 Generating FRD...")
         frd_path = await frd_generator.generate_frd(
             work_item_id=work_item_id, documents=documents
         )
 
-        logger.info(f"📄 FRD generated at: {frd_path}")
+        logger.error(f"📄 FRD GENERATED: {frd_path}")
 
-        logger.info("📤 Uploading FRD to Azure DevOps...")
-
+        # -------------------------------
+        # STEP 3: Upload back to ADO
+        # -------------------------------
+        logger.error("📤 Uploading to Azure DevOps...")
         await work_item_service.upload_frd_to_work_item(work_item_id, frd_path)
 
-        logger.info(f"✅ FRD successfully uploaded for WI #{work_item_id}")
+        logger.error("✅ PIPELINE COMPLETED SUCCESSFULLY")
 
-    except Exception:
-        logger.error(f"🔥 FRD PIPELINE FAILED for WI #{work_item_id}", exc_info=True)
+    except Exception as e:
+        logger.error("🔥🔥🔥 PIPELINE CRASHED 🔥🔥🔥")
+        import traceback
+
+        traceback.print_exc()

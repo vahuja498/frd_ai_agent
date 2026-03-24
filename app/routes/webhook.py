@@ -20,16 +20,20 @@ router = APIRouter()
 # 🔍 Extract Tags (handles ADO variations)
 # -------------------------------
 def extract_tags(payload: dict) -> str:
-    try:
-        return payload["resource"]["fields"].get("System.Tags", "")
-    except Exception:
-        return (
-            payload.get("resource", {})
-            .get("revision", {})
-            .get("fields", {})
-            .get("System.Tags", "")
-            or ""
-        )
+    resource = payload.get("resource", {})
+
+    # 1. Try standard location
+    tags = resource.get("fields", {}).get("System.Tags")
+    if tags:
+        return tags
+
+    # 2. Try revision (THIS IS YOUR CASE)
+    tags = resource.get("revision", {}).get("fields", {}).get("System.Tags")
+    if tags:
+        return tags
+
+    # 3. Fallback
+    return ""
 
 
 # -------------------------------

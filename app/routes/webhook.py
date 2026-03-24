@@ -1,13 +1,11 @@
 """
-Webhook Route - Receives Azure DevOps Work Item events
+Azure DevOps Webhook Handler
 Triggers FRD generation when a Work Item is tagged as 'presales'
 """
 
 import logging
-from fastapi import APIRouter, Request, HTTPException, BackgroundTasks, Header
-from typing import Optional
+from fastapi import APIRouter, Request, BackgroundTasks, HTTPException
 
-from app.models.webhook_payload import AzureDevOpsWebhookPayload
 from app.services.work_item_service import WorkItemService
 from app.services.frd_generator import FRDGeneratorService
 
@@ -15,102 +13,105 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+# -------------------------------
+# 🔍 Helper: Extract Tags Safely
+# -------------------------------
+def extract_tags(payload: dict) -> str:
+    try:
+        return payload["resource"]["fields"].get("System.Tags", "")
+    except Exception:
+        return (
+            payload.get("resource", {})
+            .get("revision", {})
+            .get("fields", {})
+            .get("System.Tags", "")
+            or ""
+        )
+
+
+# -------------------------------
+# 🚀 Webhook Endpoint
+# -------------------------------
 @router.post("/webhook/azure-devops")
-async def handle_azure_devops_webhook(
-    request: Request,
-    background_tasks: BackgroundTasks,
-    x_hub_signature: Optional[str] = Header(None),
-):
-    """
-    Receives Azure DevOps webhook events.
-    Triggers FRD generation when a Work Item is tagged with 'presales'.
-    """
+async def handle_webhook(request: Request, background_tasks: BackgroundTasks):
+    logger.warning("🚨 WEBHOOK HIT 🚨")
 
     try:
-        payload_data = await request.json()
-        logger.info(f"🔥 FULL PAYLOAD: {payload_data}")
-
-        payload = AzureDevOpsWebhookPayload(**payload_data)
-
+        payload = await request.json()
     except Exception as e:
-        logger.error(f"❌ Failed to parse webhook payload: {e}")
-        raise HTTPException(status_code=400, detail=f"Invalid payload: {str(e)}")
+        logger.error("❌ Invalid JSON", exc_info=True)
+        raise HTTPException(status_code=400, detail="Invalid JSON")
 
-    logger.info(
-        f"📩 Event: {payload.eventType} | Work Item ID: {payload.resource.get('id')}"
-    )
+    event_type = payload.get("eventType", "")
+    work_item_id = payload.get("resource", {}).get("id") or payload.get(
+        "resource", {}
+    ).get("workItemId")
+
+    logger.warning(f"📩 EVENT TYPE: {event_type}")
+    logger.warning(f"🔢 WORK ITEM ID: {work_item_id}")
 
     # ✅ Only process relevant events
-    if payload.eventType not in ["workitem.created", "workitem.updated"]:
-        return {"status": "ignored", "reason": "Event type not relevant"}
+    if event_type not in ["workitem.created", "workitem.updated"]:
+        return {"status": "ignored", "reason": "Event not relevant"}
 
-    work_item_service = WorkItemService()
+    if not work_item_id:
+        raise HTTPException(status_code=400, detail="Missing Work Item ID")
 
-    # ✅ Extract tags safely
-    tags = payload.resource.get("fields", {}).get("System.Tags", "")
-    logger.info(f"🏷️ TAGS: {tags}")
+    # -------------------------------
+    # 🏷️ Tag Detection (Robust)
+    # -------------------------------
+    tags = extract_tags(payload)
+    logger.warning(f"🏷️ TAGS: {tags}")
 
     is_presales = "presales" in tags.lower()
 
     if not is_presales:
-        logger.info("⛔ Work item is NOT tagged as 'presales'")
+        logger.warning("⛔ Not a presales item. Ignoring.")
         return {"status": "ignored", "reason": "No presales tag"}
 
-    work_item_id = payload.resource.get("id") or payload.resource.get("workItemId")
+    logger.warning(f"✅ PRESALES DETECTED → Work Item #{work_item_id}")
 
-    if not work_item_id:
-        raise HTTPException(status_code=400, detail="Work item ID not found")
-
-    logger.info(f"✅ Presales detected → Triggering FRD for #{work_item_id}")
-
-    # ✅ Run async background job
-    background_tasks.add_task(
-        process_frd_generation,
-        work_item_id=work_item_id,
-    )
+    # -------------------------------
+    # 🚀 Background Task
+    # -------------------------------
+    background_tasks.add_task(process_frd, work_item_id)
 
     return {
         "status": "accepted",
-        "message": f"FRD generation triggered for Work Item #{work_item_id}",
-        "work_item_id": work_item_id,
+        "message": f"FRD generation started for Work Item {work_item_id}",
     }
 
 
-# =========================
-# BACKGROUND TASK
-# =========================
-
-
-async def process_frd_generation(work_item_id: int):
-    """Background task: fetch docs → generate FRD → upload"""
-
+# -------------------------------
+# 🤖 Background Processor
+# -------------------------------
+async def process_frd(work_item_id: int):
     work_item_service = WorkItemService()
     frd_generator = FRDGeneratorService()
 
     try:
-        logger.info(f"📄 Fetching attachments for Work Item #{work_item_id}...")
+        logger.warning(f"📄 Fetching work item #{work_item_id}")
 
         documents = await work_item_service.fetch_work_item_documents(work_item_id)
+        logger.warning(f"📎 DOCUMENTS: {documents}")
 
         if not documents:
-            logger.warning(f"⚠️ No documents found for Work Item #{work_item_id}")
+            logger.warning("⚠️ No documents found. Skipping FRD.")
             return
 
-        logger.info(f"🤖 Generating FRD for Work Item #{work_item_id}...")
+        logger.warning("🤖 Generating FRD...")
 
-        frd_docx_path = await frd_generator.generate_frd(
-            work_item_id=work_item_id,
-            documents=documents,
+        frd_path = await frd_generator.generate_frd(
+            work_item_id=work_item_id, documents=documents
         )
 
-        logger.info(f"📤 Uploading FRD to Work Item #{work_item_id}...")
+        logger.warning(f"📄 Generated file: {frd_path}")
 
-        await work_item_service.upload_frd_to_work_item(work_item_id, frd_docx_path)
+        logger.warning("📤 Uploading FRD to Azure DevOps...")
 
-        logger.info(f"✅ FRD generation COMPLETE for Work Item #{work_item_id}")
+        await work_item_service.upload_frd_to_work_item(work_item_id, frd_path)
+
+        logger.warning(f"✅ FRD SUCCESS for Work Item #{work_item_id}")
 
     except Exception as e:
-        logger.error(
-            f"❌ FRD generation failed for Work Item #{work_item_id}: {e}",
-            exc_info=True,
-        )
+        logger.error(f"🔥 FRD FAILED for Work Item #{work_item_id}", exc_info=True)

@@ -7,11 +7,11 @@ Interacts with Azure DevOps REST API to:
 """
 
 import logging
-import os
 import base64
-import httpx
-from typing import List, Optional
 from pathlib import Path
+from typing import List
+
+import httpx
 
 from app.models.webhook_payload import AzureDevOpsWebhookPayload, WorkItemDocument
 from app.utils.document_extractor import DocumentExtractor
@@ -29,10 +29,13 @@ class WorkItemService:
         self.extractor = DocumentExtractor()
 
     def _build_auth_header(self) -> dict:
+        if not self.pat:
+            raise ValueError("ADO_PAT is missing")
+
         token = base64.b64encode(f":{self.pat}".encode()).decode()
         return {
             "Authorization": f"Basic {token}",
-            "Content-Type": "application/json",
+            "Accept": "application/json",
         }
 
     async def has_generated_frd(self, work_item_id: int) -> bool:
@@ -55,7 +58,7 @@ class WorkItemService:
                 if rel.get("rel") != "AttachedFile":
                     continue
 
-                attrs = rel.get("attributes", {})
+                attrs = rel.get("attributes", {}) or {}
                 name = (attrs.get("name") or "").lower()
                 comment = (attrs.get("comment") or "").lower()
 
@@ -70,14 +73,12 @@ class WorkItemService:
     def is_presales_tagged(self, payload: AzureDevOpsWebhookPayload) -> bool:
         """
         Checks whether the Work Item payload contains the 'presales' tag.
-        Handles both workitem.created/updated events (resource.fields) and
-        older formats where tags may be on resource directly.
+        Handles both workitem.created/updated events.
         """
-        resource = payload.resource
+        resource = payload.resource or {}
 
-        # Check in fields dict (standard ADO format)
-        fields = resource.get("fields", {})
-        tags_str: str = (
+        fields = resource.get("fields", {}) or {}
+        tags_str = (
             fields.get("System.Tags", "")
             or fields.get("System.Tags;", "")
             or resource.get("tags", "")
@@ -85,16 +86,15 @@ class WorkItemService:
         )
 
         if tags_str:
-            tags = [t.strip().lower() for t in tags_str.split(";")]
+            tags = [t.strip().lower() for t in tags_str.split(";") if t.strip()]
             if "presales" in tags:
                 return True
 
-        # Check in revision fields (workitem.updated)
-        revision = resource.get("revision", {})
-        rev_fields = revision.get("fields", {})
+        revision = resource.get("revision", {}) or {}
+        rev_fields = revision.get("fields", {}) or {}
         rev_tags = rev_fields.get("System.Tags", "") or ""
         if rev_tags:
-            tags = [t.strip().lower() for t in rev_tags.split(";")]
+            tags = [t.strip().lower() for t in rev_tags.split(";") if t.strip()]
             if "presales" in tags:
                 return True
 
@@ -109,24 +109,18 @@ class WorkItemService:
         """
         documents: List[WorkItemDocument] = []
 
-        async with httpx.AsyncClient(timeout=60) as client:
-            # 1. Get work item with attachments relation
+        async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
             wi_url = (
                 f"{self.org_url}/{settings.ADO_PROJECT_ENCODED}/_apis/wit/workitems/{work_item_id}"
                 f"?$expand=relations&api-version=7.1"
             )
-            try:
-                resp = await client.get(wi_url, headers=self._auth_header)
-                print("RESPONSE:", resp.text)  # 🔥 VERY IMPORTANT
-                resp.raise_for_status()
-            except Exception as e:
-                print("ERROR:", str(e))
-                raise
+
+            resp = await client.get(wi_url, headers=self._auth_header)
+            resp.raise_for_status()
 
             work_item = resp.json()
-
-            relations = work_item.get("relations", [])
-            logger.info(
+            relations = work_item.get("relations", []) or []
+            logger.warning(
                 f"Found {len(relations)} relations on Work Item #{work_item_id}"
             )
 
@@ -135,11 +129,16 @@ class WorkItemService:
                 if rel_type != "AttachedFile":
                     continue
 
-                attachment_url = relation["url"]
-                attrs = relation.get("attributes", {})
+                attachment_url = relation.get("url")
+                if not attachment_url:
+                    logger.warning("Skipping attachment relation with missing URL")
+                    continue
+
+                attrs = relation.get("attributes", {}) or {}
                 filename = attrs.get("name", "unknown.bin")
 
-                logger.info(f"Downloading attachment: {filename}")
+                logger.warning(f"Downloading attachment: {filename}")
+
                 try:
                     file_resp = await client.get(
                         attachment_url, headers=self._auth_header
@@ -148,18 +147,19 @@ class WorkItemService:
                     content_bytes = file_resp.content
 
                     text_content = self.extractor.extract_text(filename, content_bytes)
-                    doc_type = self._classify_document(filename, text_content)
+                    doc_type = self._classify_document(filename, text_content or "")
 
                     documents.append(
                         WorkItemDocument(
                             filename=filename,
-                            content=text_content,
+                            content=text_content or "",
                             doc_type=doc_type,
                             url=attachment_url,
                         )
                     )
-                    logger.info(
-                        f"Extracted document: {filename} → type={doc_type}, chars={len(text_content)}"
+
+                    logger.warning(
+                        f"Extracted document: {filename} → type={doc_type}, chars={len(text_content or '')}"
                     )
                 except Exception as e:
                     logger.warning(f"Failed to process attachment {filename}: {e}")
@@ -169,7 +169,7 @@ class WorkItemService:
     def _classify_document(self, filename: str, content: str) -> str:
         """Classify document type based on filename and content keywords."""
         name_lower = filename.lower()
-        content_lower = content.lower()
+        content_lower = (content or "").lower()
 
         if any(
             k in name_lower for k in ["sow", "statement_of_work", "statement-of-work"]
@@ -180,7 +180,6 @@ class WorkItemService:
         if any(k in name_lower for k in ["transcript", "recording", "call"]):
             return "transcript"
 
-        # Fallback: keyword scan in content
         sow_keywords = [
             "scope of work",
             "deliverables",
@@ -210,30 +209,38 @@ class WorkItemService:
 
     async def upload_frd_to_work_item(self, work_item_id: int, frd_path: Path) -> None:
         """Uploads the generated FRD .docx file as an attachment to the Work Item."""
-        async with httpx.AsyncClient(timeout=60) as client:
-            # Step 1: Upload the file to ADO attachments store
+        async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
             upload_url = (
                 f"{self.org_url}/{settings.ADO_PROJECT_ENCODED}/_apis/wit/attachments"
                 f"?fileName={frd_path.name}&api-version=7.1"
             )
+
             with open(frd_path, "rb") as f:
                 file_data = f.read()
 
-            headers = {**self._auth_header, "Content-Type": "application/octet-stream"}
-            resp = await client.post(upload_url, headers=headers, content=file_data)
+            upload_headers = {
+                **self._auth_header,
+                "Content-Type": "application/octet-stream",
+            }
+
+            resp = await client.post(
+                upload_url, headers=upload_headers, content=file_data
+            )
             resp.raise_for_status()
+
             attachment = resp.json()
             attachment_url = attachment["url"]
 
-            # Step 2: Link attachment to Work Item
             patch_url = (
                 f"{self.org_url}/{settings.ADO_PROJECT_ENCODED}/_apis/wit/workitems/{work_item_id}"
                 f"?api-version=7.1"
             )
+
             patch_headers = {
                 **self._auth_header,
                 "Content-Type": "application/json-patch+json",
             }
+
             patch_body = [
                 {
                     "op": "add",
@@ -248,8 +255,12 @@ class WorkItemService:
                     },
                 }
             ]
+
             resp2 = await client.patch(
-                patch_url, headers=patch_headers, json=patch_body
+                patch_url,
+                headers=patch_headers,
+                json=patch_body,
             )
             resp2.raise_for_status()
-            logger.info(f"✅ FRD uploaded and linked to Work Item #{work_item_id}")
+
+            logger.warning(f"✅ FRD uploaded and linked to Work Item #{work_item_id}")

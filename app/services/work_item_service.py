@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 class WorkItemService:
     def __init__(self):
         self.org_url = settings.ADO_ORG_URL.rstrip("/")
-        self.project = settings.ADO_PROJECT_ENCODED
+        self.project = settings.ADO_PROJECT
         self.pat = settings.ADO_PAT
         self._auth_header = self._build_auth_header()
         self.extractor = DocumentExtractor()
@@ -68,7 +68,9 @@ class WorkItemService:
 
         return False
 
-    async def fetch_work_item_documents(self, work_item_id: int) -> List[WorkItemDocument]:
+    async def fetch_work_item_documents(
+        self, work_item_id: int
+    ) -> List[WorkItemDocument]:
         """
         Fetches all attachments from the Work Item and extracts text content.
         Categorizes documents as sow, mom, transcript, or other.
@@ -78,7 +80,7 @@ class WorkItemService:
         async with httpx.AsyncClient(timeout=60) as client:
             # 1. Get work item with attachments relation
             wi_url = (
-                f"{self.org_url}/{self.project}/_apis/wit/workitems/{work_item_id}"
+                f"{self.org_url}/{settings.ADO_PROJECT_ENCODED}/_apis/wit/workitems/{work_item_id}"
                 f"?$expand=relations&api-version=7.1"
             )
             resp = await client.get(wi_url, headers=self._auth_header)
@@ -86,7 +88,9 @@ class WorkItemService:
             work_item = resp.json()
 
             relations = work_item.get("relations", [])
-            logger.info(f"Found {len(relations)} relations on Work Item #{work_item_id}")
+            logger.info(
+                f"Found {len(relations)} relations on Work Item #{work_item_id}"
+            )
 
             for relation in relations:
                 rel_type = relation.get("rel", "")
@@ -99,7 +103,9 @@ class WorkItemService:
 
                 logger.info(f"Downloading attachment: {filename}")
                 try:
-                    file_resp = await client.get(attachment_url, headers=self._auth_header)
+                    file_resp = await client.get(
+                        attachment_url, headers=self._auth_header
+                    )
                     file_resp.raise_for_status()
                     content_bytes = file_resp.content
 
@@ -114,7 +120,9 @@ class WorkItemService:
                             url=attachment_url,
                         )
                     )
-                    logger.info(f"Extracted document: {filename} → type={doc_type}, chars={len(text_content)}")
+                    logger.info(
+                        f"Extracted document: {filename} → type={doc_type}, chars={len(text_content)}"
+                    )
                 except Exception as e:
                     logger.warning(f"Failed to process attachment {filename}: {e}")
 
@@ -125,7 +133,9 @@ class WorkItemService:
         name_lower = filename.lower()
         content_lower = content.lower()
 
-        if any(k in name_lower for k in ["sow", "statement_of_work", "statement-of-work"]):
+        if any(
+            k in name_lower for k in ["sow", "statement_of_work", "statement-of-work"]
+        ):
             return "sow"
         if any(k in name_lower for k in ["mom", "minutes", "meeting"]):
             return "mom"
@@ -133,8 +143,18 @@ class WorkItemService:
             return "transcript"
 
         # Fallback: keyword scan in content
-        sow_keywords = ["scope of work", "deliverables", "payment terms", "statement of work"]
-        mom_keywords = ["minutes of meeting", "attendees", "action items", "meeting date"]
+        sow_keywords = [
+            "scope of work",
+            "deliverables",
+            "payment terms",
+            "statement of work",
+        ]
+        mom_keywords = [
+            "minutes of meeting",
+            "attendees",
+            "action items",
+            "meeting date",
+        ]
         transcript_keywords = ["speaker", "00:", "transcript", "[00:", "host:"]
 
         sow_score = sum(1 for k in sow_keywords if k in content_lower)
@@ -172,7 +192,10 @@ class WorkItemService:
                 f"{self.org_url}/{self.project}/_apis/wit/workitems/{work_item_id}"
                 f"?api-version=7.1"
             )
-            patch_headers = {**self._auth_header, "Content-Type": "application/json-patch+json"}
+            patch_headers = {
+                **self._auth_header,
+                "Content-Type": "application/json-patch+json",
+            }
             patch_body = [
                 {
                     "op": "add",
@@ -187,6 +210,8 @@ class WorkItemService:
                     },
                 }
             ]
-            resp2 = await client.patch(patch_url, headers=patch_headers, json=patch_body)
+            resp2 = await client.patch(
+                patch_url, headers=patch_headers, json=patch_body
+            )
             resp2.raise_for_status()
             logger.info(f"✅ FRD uploaded and linked to Work Item #{work_item_id}")

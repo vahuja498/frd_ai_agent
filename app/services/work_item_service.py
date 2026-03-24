@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 class WorkItemService:
     def __init__(self):
         self.org_url = settings.ADO_ORG_URL.rstrip("/")
-        self.project = settings.ADO_PROJECT
+        self.project = settings.ADO_PROJECT_ENCODED
         self.pat = settings.ADO_PAT
         self._auth_header = self._build_auth_header()
         self.extractor = DocumentExtractor()

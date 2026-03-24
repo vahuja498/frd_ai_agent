@@ -84,8 +84,7 @@ class WorkItemService:
                 f"?$expand=relations&api-version=7.1"
             )
             try:
-                resp = await client.get(wi_url)
-                print("STATUS:", resp.status_code)
+                resp = await client.get(wi_url, headers=self._auth_header)
                 print("RESPONSE:", resp.text)  # 🔥 VERY IMPORTANT
                 resp.raise_for_status()
             except Exception as e:
@@ -182,7 +181,7 @@ class WorkItemService:
         async with httpx.AsyncClient(timeout=60) as client:
             # Step 1: Upload the file to ADO attachments store
             upload_url = (
-                f"{self.org_url}/{self.project}/_apis/wit/attachments"
+                f"{self.org_url}/{settings.ADO_PROJECT_ENCODED}/_apis/wit/attachments"
                 f"?fileName={frd_path.name}&api-version=7.1"
             )
             with open(frd_path, "rb") as f:
@@ -196,7 +195,7 @@ class WorkItemService:
 
             # Step 2: Link attachment to Work Item
             patch_url = (
-                f"{self.org_url}/{self.project}/_apis/wit/workitems/{work_item_id}"
+                f"{self.org_url}/{settings.ADO_PROJECT_ENCODED}/_apis/wit/workitems/{work_item_id}"
                 f"?api-version=7.1"
             )
             patch_headers = {

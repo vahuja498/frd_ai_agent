@@ -25,7 +25,7 @@ class Settings(BaseSettings):
     # -------------------------------
     HF_API_TOKEN: str = os.getenv("HF_API_TOKEN")
 
-    HF_MODEL: str = os.getenv("HF_MODEL", "mistralai/Mistral-7B-Instruct-v0.3")
+    HF_MODEL: str = os.getenv("HF_MODEL", "HuggingFaceH4/zephyr-7b-beta")
 
     # -------------------------------
     # 🔐 Optional Security

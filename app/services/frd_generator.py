@@ -444,7 +444,10 @@ Source Content:
                 json=payload,
             )
 
-        response.raise_for_status()
+        if response.status_code in (410, 404, 503):
+                logger.warning(f"HuggingFace model unavailable ({response.status_code}) — skipping LLM.")
+                return ""
+            response.raise_for_status()
         data = response.json()
 
         # Common HF text-gen response shapes

@@ -1,11 +1,9 @@
 """
 Azure DevOps Webhook Handler
 Triggers FRD generation when a Work Item is tagged as 'presales'
+Stops re-processing if an FRD is already attached
 """
 
-import os
-
-print("🔥 FILE LOADED:", __file__)
 import logging
 from fastapi import APIRouter, Request, BackgroundTasks, HTTPException
 
@@ -16,35 +14,25 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-# -------------------------------
-# 🔍 Extract Tags (handles ADO variations)
-# -------------------------------
 def extract_tags(payload: dict) -> str:
     resource = payload.get("resource", {})
 
-    # 1. Try standard location
     tags = resource.get("fields", {}).get("System.Tags")
     if tags:
         return tags
 
-    # 2. Try revision (THIS IS YOUR CASE)
     tags = resource.get("revision", {}).get("fields", {}).get("System.Tags")
     if tags:
         return tags
 
-    # 3. Fallback
     return ""
 
 
-# -------------------------------
-# 🚀 Webhook Endpoint
-# -------------------------------
 @router.post("/webhook/azure-devops")
 async def handle_webhook(request: Request, background_tasks: BackgroundTasks):
-    logger.error("🔥 WEBHOOK EXECUTED (NEW CODE) 🔥")
+    logger.info("🔥 WEBHOOK EXECUTED")
 
     try:
-        logger.error("🚨 NEW WEBHOOK HIT 🚨")
         payload = await request.json()
     except Exception:
         logger.error("❌ Invalid JSON received", exc_info=True)
@@ -53,21 +41,15 @@ async def handle_webhook(request: Request, background_tasks: BackgroundTasks):
     event_type = payload.get("eventType", "")
     resource = payload.get("resource", {})
 
-    work_item_id = resource.get("workItemId")
-    if not work_item_id:
-        revision = resource.get("revision", {})
-        work_item_id = revision.get("id")
-
-    if not work_item_id:
-        logger.error("❌ Work Item ID missing")
-        raise HTTPException(status_code=400, detail="Missing Work Item ID")
+    work_item_id = (
+        resource.get("workItemId")
+        or resource.get("revision", {}).get("id")
+        or resource.get("id")
+    )
 
     logger.info(f"📩 Event: {event_type}")
     logger.info(f"🔢 Work Item ID: {work_item_id}")
 
-    # -------------------------------
-    # ✅ Validate Event
-    # -------------------------------
     if event_type not in ["workitem.created", "workitem.updated"]:
         logger.warning("⛔ Ignored event type")
         return {"status": "ignored", "reason": "event not supported"}
@@ -76,24 +58,17 @@ async def handle_webhook(request: Request, background_tasks: BackgroundTasks):
         logger.error("❌ Work Item ID missing")
         raise HTTPException(status_code=400, detail="Missing Work Item ID")
 
-    # -------------------------------
-    # 🏷️ Tag Detection
-    # -------------------------------
     tags = extract_tags(payload)
     logger.info(f"🏷️ Tags: {tags}")
 
     is_presales = "presales" in tags.lower()
-
     if not is_presales:
         logger.warning("⛔ Not a presales item")
         return {"status": "ignored", "reason": "no presales tag"}
 
     logger.info(f"✅ Presales detected for Work Item #{work_item_id}")
 
-    # -------------------------------
-    # 🚀 Trigger Background Task
-    # -------------------------------
-    background_tasks.add_task(process_frd_pipeline, work_item_id)
+    background_tasks.add_task(process_frd_pipeline, int(work_item_id))
 
     return {
         "status": "accepted",
@@ -101,9 +76,6 @@ async def handle_webhook(request: Request, background_tasks: BackgroundTasks):
     }
 
 
-# -------------------------------
-# 🤖 Background FRD Pipeline
-# -------------------------------
 async def process_frd_pipeline(work_item_id: int):
     logger.error(f"🚀 PIPELINE STARTED for WI {work_item_id}")
 
@@ -111,21 +83,23 @@ async def process_frd_pipeline(work_item_id: int):
         work_item_service = WorkItemService()
         frd_generator = FRDGeneratorService()
 
-        # -------------------------------
-        # STEP 1: Fetch documents
-        # -------------------------------
+        # STOP LOOP: if FRD already exists, do nothing
+        already_exists = await work_item_service.has_generated_frd(work_item_id)
+        if already_exists:
+            logger.warning(
+                f"⏭️ FRD already exists for WI {work_item_id}. Skipping regeneration."
+            )
+            return
+
         logger.error("📄 Fetching documents...")
         documents = await work_item_service.fetch_work_item_documents(work_item_id)
 
-        logger.error(f"📎 Documents fetched: {documents}")
+        logger.error(f"📎 Documents fetched: {len(documents)}")
 
         if not documents:
             logger.error("❌ NO DOCUMENTS FOUND - STOPPING")
             return
 
-        # -------------------------------
-        # STEP 2: Generate FRD
-        # -------------------------------
         logger.error("🤖 Generating FRD...")
         frd_path = await frd_generator.generate_frd(
             work_item_id=work_item_id, documents=documents
@@ -133,16 +107,10 @@ async def process_frd_pipeline(work_item_id: int):
 
         logger.error(f"📄 FRD GENERATED: {frd_path}")
 
-        # -------------------------------
-        # STEP 3: Upload back to ADO
-        # -------------------------------
         logger.error("📤 Uploading to Azure DevOps...")
         await work_item_service.upload_frd_to_work_item(work_item_id, frd_path)
 
         logger.error("✅ PIPELINE COMPLETED SUCCESSFULLY")
 
-    except Exception as e:
-        logger.error("🔥🔥🔥 PIPELINE CRASHED 🔥🔥🔥")
-        import traceback
-
-        traceback.print_exc()
+    except Exception:
+        logger.error("🔥🔥🔥 PIPELINE CRASHED 🔥🔥🔥", exc_info=True)

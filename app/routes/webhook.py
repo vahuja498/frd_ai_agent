@@ -3,6 +3,9 @@ Azure DevOps Webhook Handler
 Triggers FRD generation when a Work Item is tagged as 'presales'
 """
 
+import os
+
+print("🔥 FILE LOADED:", __file__)
 import logging
 from fastapi import APIRouter, Request, BackgroundTasks, HTTPException
 
@@ -37,6 +40,7 @@ async def handle_webhook(request: Request, background_tasks: BackgroundTasks):
     logger.error("🔥 WEBHOOK EXECUTED (NEW CODE) 🔥")
 
     try:
+        logger.error("🚨 NEW WEBHOOK HIT 🚨")
         payload = await request.json()
     except Exception:
         logger.error("❌ Invalid JSON received", exc_info=True)

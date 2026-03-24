@@ -82,8 +82,6 @@ async def handle_azure_devops_webhook(
 
 
 async def process_frd_generation(work_item_id: int):
-    """Background task: fetch docs → generate FRD → upload"""
-
     work_item_service = WorkItemService()
     frd_generator = FRDGeneratorService()
 
@@ -91,26 +89,26 @@ async def process_frd_generation(work_item_id: int):
         logger.info(f"📄 Fetching attachments for Work Item #{work_item_id}...")
 
         documents = await work_item_service.fetch_work_item_documents(work_item_id)
+        logger.info(f"📄 Documents: {documents}")
 
         if not documents:
-            logger.warning(f"⚠️ No documents found for Work Item #{work_item_id}")
+            logger.warning(f"⚠️ No documents found")
             return
 
-        logger.info(f"🤖 Generating FRD for Work Item #{work_item_id}...")
+        logger.info("🤖 Generating FRD...")
 
         frd_docx_path = await frd_generator.generate_frd(
             work_item_id=work_item_id,
             documents=documents,
         )
 
-        logger.info(f"📤 Uploading FRD to Work Item #{work_item_id}...")
+        logger.info(f"📄 Generated file: {frd_docx_path}")
+
+        logger.info("📤 Uploading FRD...")
 
         await work_item_service.upload_frd_to_work_item(work_item_id, frd_docx_path)
 
-        logger.info(f"✅ FRD generation COMPLETE for Work Item #{work_item_id}")
+        logger.info("✅ DONE")
 
     except Exception as e:
-        logger.error(
-            f"❌ FRD generation failed for Work Item #{work_item_id}: {e}",
-            exc_info=True,
-        )
+        logger.error("🔥 REAL ERROR BELOW 👇", exc_info=True)

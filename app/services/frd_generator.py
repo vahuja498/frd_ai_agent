@@ -27,13 +27,18 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
+from huggingface_hub import InferenceClient
+
 
 class FRDGeneratorService:
     def __init__(self) -> None:
         self.hf_token = settings.HF_API_TOKEN
         self.model = settings.HF_MODEL
+
         self.output_dir = Path(settings.OUTPUT_DIR)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        self.client = InferenceClient(api_key=self.hf_token)
 
         self.api_url = f"https://api-inference.huggingface.co/models/{self.model}"
         self.http_headers = {
@@ -412,56 +417,24 @@ Source Content:
         max_new_tokens: int = 1200,
         temperature: float = 0.2,
     ) -> str:
-        payload = {
-            "inputs": prompt,
-            "parameters": {
-                "max_new_tokens": max_new_tokens,
-                "temperature": temperature,
-                "return_full_text": False,
-                "do_sample": True,
-            },
-            "options": {
-                "wait_for_model": True,
-                "use_cache": False,
-            },
-        }
-
         try:
-            async with httpx.AsyncClient(timeout=180) as client:
-                response = await client.post(
-                    self.api_url,
-                    headers=self.http_headers,
-                    json=payload,
-                )
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are a senior business analyst writing detailed FRDs.",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=max_new_tokens,
+                temperature=temperature,
+            )
 
-            if response.status_code in (404, 410, 503):
-                logger.warning(
-                    f"HuggingFace model unavailable ({response.status_code})"
-                )
-                return ""
-
-            response.raise_for_status()
-            data = response.json()
-
-            if isinstance(data, list) and data:
-                first = data[0]
-                if isinstance(first, dict):
-                    if "generated_text" in first:
-                        return str(first["generated_text"]).strip()
-                    if "summary_text" in first:
-                        return str(first["summary_text"]).strip()
-
-            if isinstance(data, dict):
-                if "generated_text" in data:
-                    return str(data["generated_text"]).strip()
-                if "error" in data:
-                    logger.warning(f"Hugging Face inference error: {data['error']}")
-                    return ""
-
-            return ""
+            return response.choices[0].message.content.strip()
 
         except Exception as e:
-            logger.warning(f"LLM call failed, using fallback: {e}")
+            logger.warning(f"HuggingFace call failed, using fallback: {e}")
             return ""
 
     def _parse_json_response(self, text: str) -> Optional[Dict[str, Any]]:

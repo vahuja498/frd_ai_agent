@@ -1,4 +1,4 @@
-# Web Framework
+# Web Framework Update
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
 gunicorn==22.0.0

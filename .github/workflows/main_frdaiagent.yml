@@ -15,26 +15,36 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Create virtual environment and install dependencies
+      - name: Install dependencies
         run: |
-          python -m venv antenv
-          source antenv/bin/activate
-          pip install --upgrade pip
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
 
       - name: Upload artifact for deployment
         uses: actions/upload-artifact@v4
         with:
           name: python-app
-          path: .
-          include-hidden-files: true
+          path: |
+            .
+            !antenv/
+            !antenv/**
+            !.git/
+            !.git/**
+            !tests/
+            !tests/**
+            !docs/
+            !docs/**
+            !__pycache__/
+            !**/__pycache__/**
+            !*.pyc
 
   deploy:
     runs-on: ubuntu-latest

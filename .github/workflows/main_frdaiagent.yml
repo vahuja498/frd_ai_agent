@@ -20,20 +20,31 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Create and start virtual environment and install dependencies
+      - name: Install dependencies for validation
         run: |
           python -m venv antenv
           source antenv/bin/activate
           pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Create clean deploy package
+        run: |
+          mkdir deploy
+          rsync -av \
+            --exclude '.git' \
+            --exclude '.github' \
+            --exclude 'antenv' \
+            --exclude '__pycache__' \
+            --exclude '*.pyc' \
+            --exclude 'tests' \
+            --exclude 'docs' \
+            ./ deploy/
+
       - name: Upload artifact for deployment jobs
         uses: actions/upload-artifact@v4
         with:
           name: python-app
-          path: |
-            .
-            !antenv/
+          path: deploy
 
   deploy:
     runs-on: ubuntu-latest
@@ -47,6 +58,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: python-app
+          path: deploy
 
       - name: Login to Azure
         uses: azure/login@v2
@@ -56,8 +68,7 @@ jobs:
           subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_B6741137F9B740CDA49FA3492010049E }}
 
       - name: Deploy to Azure Web App
-        id: deploy-to-webapp
         uses: azure/webapps-deploy@v3
         with:
           app-name: frdaiagent
-          package: .
+          package: deploy

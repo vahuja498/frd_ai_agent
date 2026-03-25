@@ -452,10 +452,12 @@ Return a short acceptance/sign-off section and include a markdown sign-off table
         max_output_tokens: int,
         temperature: float,
     ) -> str:
-        url = (
-            f"https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{self.gemini_model}:generateContent?key={self.gemini_api_key}"
-        )
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.gemini_model}:generateContent"
+
+        headers = {
+            "Content-Type": "application/json",
+            "x-goog-api-key": self.gemini_api_key,  # ✅ SAFE
+        }
 
         payload = {
             "contents": [{"parts": [{"text": prompt}]}],
@@ -466,7 +468,7 @@ Return a short acceptance/sign-off section and include a markdown sign-off table
         }
 
         async with httpx.AsyncClient(timeout=90) as client:
-            resp = await client.post(url, json=payload)
+            resp = await client.post(url, json=payload, headers=headers)
             resp.raise_for_status()
             data = resp.json()
 
@@ -509,7 +511,9 @@ Return a short acceptance/sign-off section and include a markdown sign-off table
         if completion and getattr(completion, "choices", None):
             message = completion.choices[0].message
             if message and getattr(message, "content", None):
-                return message.content.strip()
+                content = getattr(message, "content", None)
+                if isinstance(content, str) and content.strip():
+                    return content.strip()
 
         return ""
 

@@ -59,7 +59,7 @@ class FRDGeneratorService:
 
         self.gemini_api_key = (getattr(settings, "GEMINI_API_KEY", "") or "").strip()
         self.gemini_model = (
-            getattr(settings, "GEMINI_MODEL", "") or "gemini-2.0-flash"
+            getattr(settings, "GEMINI_MODEL", "") or "gemini-3-flash-preview"
         ).strip()
 
         self.hf_api_token = (getattr(settings, "HF_API_TOKEN", "") or "").strip()
@@ -513,7 +513,7 @@ Write a sign-off section including:
         temperature: float,
     ) -> str:
         # FIX: Use safe default model name
-        model = self.gemini_model or "gemini-2.0-flash"
+        model = self.gemini_model or "gemini-3-flash-preview"
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
         headers = {

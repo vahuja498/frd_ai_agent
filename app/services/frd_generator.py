@@ -11,6 +11,7 @@ The service always returns a non-empty, professionally structured DOCX.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -53,12 +54,12 @@ class FRDGeneratorService:
     ]
 
     def __init__(self) -> None:
-        self.output_dir = Path(getattr(settings, "OUTPUT_DIR", "output"))
+        self.output_dir = Path(getattr(settings, "OUTPUT_DIR", "outputs"))
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         self.gemini_api_key = (getattr(settings, "GEMINI_API_KEY", "") or "").strip()
         self.gemini_model = (
-            getattr(settings, "GEMINI_MODEL", "") or "gemini-1.5-flash"
+            getattr(settings, "GEMINI_MODEL", "") or "gemini-2.0-flash"
         ).strip()
 
         self.hf_api_token = (getattr(settings, "HF_API_TOKEN", "") or "").strip()
@@ -69,6 +70,9 @@ class FRDGeneratorService:
         self.hf_client: Optional[InferenceClient] = None
         if self.hf_api_token:
             self.hf_client = InferenceClient(api_key=self.hf_api_token)
+
+        # FIX: Track which model generated the FRD
+        self._last_model_used: str = "Unknown"
 
     async def generate_frd(self, work_item_id: int, documents: List[Any]) -> Path:
         if not documents:
@@ -100,8 +104,9 @@ class FRDGeneratorService:
         )
 
         logger.info(
-            "FRD generated successfully | work_item_id=%s | path=%s",
+            "FRD generated successfully | work_item_id=%s | model=%s | path=%s",
             work_item_id,
+            self._last_model_used,
             output_path,
         )
         return output_path
@@ -239,10 +244,10 @@ Return valid JSON only with this shape:
 }}
 
 Rules:
-1. Do not invent facts.
+1. Do not invent facts — only use what is in the source documents.
 2. If a fact is unknown, use "To be confirmed".
-3. Prefer business and functional interpretation over raw copying.
-4. Keep the JSON concise but meaningful.
+3. Extract specific business details: client name, platform, process steps, user roles.
+4. Keep the JSON concise but meaningful and specific to this project.
 
 Work Item ID: {work_item_id}
 Source Manifest:
@@ -277,19 +282,19 @@ Source Content:
 You are a senior functional consultant writing a polished, client-ready Functional Requirements Document.
 
 Write only the requested section content.
-Do not add a section title.
+Do not add a section title or heading.
 Do not mention that you are an AI.
-Do not invent facts.
-Use "To be confirmed" where information is unavailable.
-Prefer implementation-ready language and concise structure.
-Where suitable, use markdown lists or markdown tables.
+Do not invent facts — only use what is in the source documents.
+Use "To be confirmed" only where information is genuinely unavailable.
+Use specific names, systems, fields, and processes from the source documents.
+Prefer implementation-ready language. Use markdown lists or markdown tables where appropriate.
 
 Work Item ID: {work_item_id}
 
-Structured Context:
+Structured Context (extracted from source documents):
 {json.dumps(context, indent=2)}
 
-Available Source Content:
+Full Source Content:
 {self._truncate(combined_source, 20000)}
 
 Section Instructions:
@@ -310,90 +315,148 @@ Section Instructions:
     def _section_instructions(self) -> Dict[str, str]:
         return {
             "overview": """
-Write a strong executive overview covering:
-- project name
-- client name
-- business context
-- problem/opportunity
-- purpose of the solution
-- expected business outcomes
-Use professional consulting language.
+Write a professional executive overview (3-4 paragraphs) covering:
+- The specific business problem or opportunity this work item addresses
+- The client name and their industry or business context
+- What the proposed solution will do at a high level
+- Measurable expected outcomes (e.g. reduce ticket resolution time, eliminate manual steps, improve visibility)
+Be specific — use the actual client name, platform, and business context from the source documents.
+No generic filler sentences. Every sentence must be grounded in the source material.
 """,
             "document_history": """
 Return a short markdown table:
 | Date | Version | Description | Author |
-Include today's draft as version 1.0 by FRD AI Agent.
+Include today's date as version 1.0 drafted by FRD AI Agent.
 """,
             "current_state": """
-Describe the current-state process, pain points, manual activities, delays, errors, or visibility issues.
-State only what is supported or clearly implied by the source.
+Based strictly on the source documents, describe:
+1. How the process currently works (step by step where possible)
+2. What systems or tools are currently used
+3. Specific pain points, delays, manual steps, or errors mentioned
+4. Who is affected and how
+Be specific. Only state what is supported by the source material.
+Do not use generic statements. Reference actual systems and teams from the documents.
 """,
             "proposed_solution": """
-Describe the requested future-state solution in business and functional terms.
-Explain what the platform/process should enable.
+Describe the future-state solution in concrete terms:
+- What platform or technology will be used (be specific — e.g. Dynamics 365, Power Automate, Azure)
+- What the core solution components are
+- How it addresses each pain point from the current state
+- What the user experience will look like
+Use business language. Be specific to this project. Reference actual systems from the source.
 """,
             "roles": """
 Return a markdown table:
 | Role | Responsibility |
-Use clear, implementation-ready responsibilities.
+List the specific roles involved in this solution with clear, implementation-ready responsibilities.
+Use the actual role names and responsibilities from the source documents.
 """,
             "application_types": """
-Explain the likely solution components or application types required.
-Examples may include Model-Driven App, Portal, API, Admin UI, Reporting Layer, Automation Workflow.
-Only include what is grounded in the source.
+Explain the specific solution components or application types required for this project.
+Examples: Model-Driven App, Power Automate Flows, Customer Portal, API Layer, Admin Configuration UI, Power BI Reporting.
+Only include what is grounded in the source documents.
 """,
             "modules_and_applications": """
-Break the solution into modules.
-For each module include:
-- module name
-- purpose
-- users
-- core features
-- key fields or data points
-- validations or exceptions
-Use subheadings and crisp bullets.
+Break the solution into specific functional modules based on the source documents.
+For each module use this format:
+
+### [Module Name]
+**Purpose:** [specific purpose]
+**Users:** [specific user roles]
+**Core Features:**
+- [specific feature]
+**Key Fields:**
+- [field name]: [description and validation rules]
+**Business Rules:**
+- [specific rule]
+
+Only include modules directly supported by the source documents.
+Use real field names and business rules where mentioned.
 """,
             "process_flows": """
-Document the main end-to-end business flows in numbered format.
-Cover user step, system action, decision, and exception handling where relevant.
+Document the main end-to-end process flows as numbered steps.
+For each major flow:
+1. Name the flow clearly
+2. List steps in format: [Actor] → [Action] → [System Response]
+3. Include decision points and exception/error paths
+Be specific to this project's actual described process, not generic steps.
 """,
             "functional_requirements": """
-Return a numbered requirement list in this exact style:
-FR-001: ...
-FR-002: ...
-Requirements must be specific, testable, and implementation-oriented.
-Generate at least 12 strong requirements if the source supports it.
+Generate SPECIFIC, TESTABLE functional requirements directly derived from the source documents.
+Each requirement must reference actual business functionality, not generic placeholders.
+
+Format exactly as:
+FR-001: The system shall [specific action] when [specific condition] so that [specific outcome].
+
+Example of BAD requirement: "The solution shall capture business data."
+Example of GOOD requirement: "The system shall automatically create a support ticket in Dynamics 365 when an inbound email is received at the configured support mailbox, capturing Subject, Sender Email, Body, and Received Timestamp as mandatory fields."
+
+Generate at least 15 strong, specific requirements grounded in the source documents.
+Each must be independently testable.
 """,
             "non_functional_requirements": """
-Return a numbered requirement list in this exact style:
-NFR-001: ...
-NFR-002: ...
-Include performance, security, auditability, usability, maintainability, reliability, and compliance considerations when relevant.
+Generate non-functional requirements specific to this project's context.
+Include actual numbers and specifics where possible:
+- Performance: specific response time targets (e.g. "page load < 3 seconds for 95% of requests")
+- Security: specific auth mechanism (e.g. "Azure AD SSO", "MFA enforced for all users")
+- Compliance: specific standards mentioned in source (e.g. PCI DSS, GDPR, UAE data residency)
+- Availability: specific SLA target (e.g. "99.5% uptime during business hours")
+- Scalability: expected concurrent users or data volume
+- Auditability: what must be logged and retained
+
+Format: NFR-001: [Category] — [specific measurable requirement]
+Generate at least 8 requirements.
 """,
             "integrations": """
-Describe integrations in a markdown table:
-| System | Purpose | Data Exchanged |
-If unclear, state "To be confirmed".
+Describe all system integrations mentioned or clearly implied in the source documents.
+Use this markdown table:
+| System | Direction | Purpose | Data Exchanged | Trigger |
+
+For each integration be specific about what data moves and when.
+If details are unclear, state what needs to be confirmed and why it is needed.
 """,
             "notifications": """
-List user/system notifications and triggers in bullet format.
+List specific notification events required by this solution:
+- Trigger condition
+- Recipient role
+- Channel (email / SMS / in-app / Teams)
+- Content summary
+Base this on the actual workflow described in the source documents.
 """,
             "reporting_visibility": """
-List reporting, dashboard, audit trail, and visibility needs in bullet format.
+List specific reports, dashboards, and visibility requirements:
+- Report or dashboard name
+- Purpose and intended audience
+- Key metrics or fields displayed
+- Refresh frequency if relevant
+Be specific to this project's business needs.
 """,
             "gap_analysis": """
-Return a markdown table:
-| Gap | Proposed Solution | Reference Section | Phase |
+Identify real gaps between what the source documents specify and what is needed for a complete implementation.
+Use this markdown table:
+| Gap | Impact | Proposed Resolution | Owner | Phase |
+
+Only list genuine gaps found in the source material — missing field definitions, unclear business rules,
+unconfirmed integrations, missing sign-off criteria, etc.
 """,
             "out_of_scope": """
-List items explicitly out of scope or not yet confirmed.
-If nothing is stated, produce cautious bullets using 'To be confirmed'.
+List items explicitly stated as out of scope in the source documents.
+Also list items that are adjacent to the solution but not confirmed in scope.
+Be specific — reference actual features, systems, or integrations.
 """,
             "assumptions_constraints": """
-List assumptions and constraints separately in bullets.
+**Assumptions:**
+- List each assumption with its implication if the assumption proves incorrect
+
+**Constraints:**
+- Technical constraints (platform version, hosting region, compliance)
+- Timeline or budget constraints mentioned
+- Integration or third-party dependency constraints
 """,
             "acceptance_signoff": """
-Return a short acceptance/sign-off section and include a markdown sign-off table:
+Write a sign-off section including:
+- Brief description of the review and approval process
+- Sign-off table with roles specific to this project:
 | Name | Role | Signature | Date |
 """,
         }
@@ -408,42 +471,39 @@ Return a short acceptance/sign-off section and include a markdown sign-off table
         max_output_tokens: int = 1200,
         temperature: float = 0.2,
     ) -> str:
-        gemini_error: Optional[str] = None
-        hf_error: Optional[str] = None
-
+        # FIX: Try Gemini first with full error visibility
         if self.gemini_api_key:
             try:
-                logger.info("Trying Gemini generation")
+                logger.info("Trying Gemini | model=%s", self.gemini_model)
                 text = await self._call_gemini(
                     prompt=prompt,
                     max_output_tokens=max_output_tokens,
                     temperature=temperature,
                 )
                 if text and text.strip():
+                    self._last_model_used = f"Gemini ({self.gemini_model})"
                     return text.strip()
             except Exception as exc:
-                gemini_error = str(exc)
                 logger.warning("Gemini generation failed | error=%s", exc)
 
+        # FIX: Try HuggingFace with async-safe call
         if self.hf_client and self.hf_api_token:
             try:
-                logger.info("Trying Hugging Face generation")
+                logger.info("Trying HuggingFace | model=%s", self.hf_model)
                 text = await self._call_huggingface(
                     prompt=prompt,
                     max_output_tokens=max_output_tokens,
                     temperature=temperature,
                 )
                 if text and text.strip():
+                    self._last_model_used = f"HuggingFace ({self.hf_model})"
                     return text.strip()
             except Exception as exc:
-                hf_error = str(exc)
-                logger.warning("Hugging Face generation failed | error=%s", exc)
+                logger.warning("HuggingFace generation failed | error=%s", exc)
 
-        logger.warning(
-            "All model providers failed; using deterministic fallback | gemini_error=%s | hf_error=%s",
-            gemini_error,
-            hf_error,
-        )
+        # Both failed — deterministic fallback
+        self._last_model_used = "Deterministic Fallback"
+        logger.warning("All model providers failed — using deterministic fallback")
         return ""
 
     async def _call_gemini(
@@ -452,11 +512,13 @@ Return a short acceptance/sign-off section and include a markdown sign-off table
         max_output_tokens: int,
         temperature: float,
     ) -> str:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.gemini_model}:generateContent"
+        # FIX: Use safe default model name
+        model = self.gemini_model or "gemini-2.0-flash"
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
         headers = {
             "Content-Type": "application/json",
-            "x-goog-api-key": self.gemini_api_key,  # ✅ SAFE
+            "x-goog-api-key": self.gemini_api_key,
         }
 
         payload = {
@@ -464,22 +526,50 @@ Return a short acceptance/sign-off section and include a markdown sign-off table
             "generationConfig": {
                 "temperature": temperature,
                 "maxOutputTokens": max_output_tokens,
+                "topP": 0.95,
             },
         }
 
-        async with httpx.AsyncClient(timeout=90) as client:
+        async with httpx.AsyncClient(timeout=120) as client:
             resp = await client.post(url, json=payload, headers=headers)
-            resp.raise_for_status()
+
+            # FIX: Log full error body so failures are visible in Azure logs
+            if resp.status_code != 200:
+                logger.error(
+                    "Gemini API error | status=%s | body=%s",
+                    resp.status_code,
+                    resp.text[:1000],
+                )
+                resp.raise_for_status()
+
             data = resp.json()
+
+        # FIX: Check for prompt blocking
+        if data.get("promptFeedback", {}).get("blockReason"):
+            logger.warning(
+                "Gemini blocked prompt | reason=%s",
+                data["promptFeedback"]["blockReason"],
+            )
+            return ""
 
         candidates = data.get("candidates", []) or []
         for candidate in candidates:
+            # FIX: Check finish reason before using response
+            finish_reason = candidate.get("finishReason", "")
+            if finish_reason not in ("STOP", "MAX_TOKENS", ""):
+                logger.warning("Gemini unexpected finishReason=%s", finish_reason)
+                continue
             content = candidate.get("content", {}) or {}
             parts = content.get("parts", []) or []
             text_parts = [p.get("text", "") for p in parts if p.get("text")]
             if text_parts:
-                return "\n".join(text_parts).strip()
+                result = "\n".join(text_parts).strip()
+                logger.info("Gemini success | chars=%s", len(result))
+                return result
 
+        logger.warning(
+            "Gemini returned empty candidates | response=%s", str(data)[:500]
+        )
         return ""
 
     async def _call_huggingface(
@@ -501,19 +591,24 @@ Return a short acceptance/sign-off section and include a markdown sign-off table
             {"role": "user", "content": prompt},
         ]
 
-        completion = self.hf_client.chat_completion(
-            model=self.hf_model,
-            messages=messages,
-            max_tokens=max_output_tokens,
-            temperature=temperature,
-        )
+        # FIX: Run blocking HuggingFace call in thread pool to avoid blocking async event loop
+        def _sync_call():
+            return self.hf_client.chat_completion(
+                model=self.hf_model,
+                messages=messages,
+                max_tokens=max_output_tokens,
+                temperature=max(temperature, 0.01),  # HF requires temperature > 0
+            )
+
+        loop = asyncio.get_event_loop()
+        completion = await loop.run_in_executor(None, _sync_call)
 
         if completion and getattr(completion, "choices", None):
             message = completion.choices[0].message
-            if message and getattr(message, "content", None):
-                content = getattr(message, "content", None)
-                if isinstance(content, str) and content.strip():
-                    return content.strip()
+            content = getattr(message, "content", None)
+            if isinstance(content, str) and content.strip():
+                logger.info("HuggingFace success | chars=%s", len(content))
+                return content.strip()
 
         return ""
 
@@ -1031,7 +1126,8 @@ Return a short acceptance/sign-off section and include a markdown sign-off table
             ("Work Item ID", f"#{work_item_id}"),
             ("Version", "1.0 — Draft"),
             ("Status", "Auto-Generated — Pending Review"),
-            ("Generated By", "FRD AI Agent"),
+            # FIX: Show which model generated this FRD
+            ("Generated By", f"FRD AI Agent — {self._last_model_used}"),
             ("Date", now.strftime("%B %d, %Y")),
         ]:
             row = meta.add_row().cells
@@ -1083,7 +1179,7 @@ Return a short acceptance/sign-off section and include a markdown sign-off table
         p = doc.add_paragraph()
         p.alignment = WD_ALIGN_PARAGRAPH.CENTER
         run = p.add_run(
-            f"FRD | {project_name} | WI#{work_item_id} | Auto-Generated by FRD AI Agent | CONFIDENTIAL | {now.strftime('%Y-%m-%d')}"
+            f"FRD | {project_name} | WI#{work_item_id} | {self._last_model_used} | CONFIDENTIAL | {now.strftime('%Y-%m-%d')}"
         )
         run.italic = True
         run.font.size = Pt(9)

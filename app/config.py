@@ -1,13 +1,12 @@
 from typing import Optional
 from urllib.parse import quote
+import os
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
         extra="ignore",
     )
 
@@ -18,7 +17,7 @@ class Settings(BaseSettings):
 
     # AI Model Configuration
     GEMINI_API_KEY: str = ""
-    GEMINI_MODEL: str = "gemini-1.5-flash"
+    GEMINI_MODEL: str = "gemini-2.0-flash"
 
     HF_API_TOKEN: str = ""
     HF_MODEL: str = "mistralai/Mistral-7B-Instruct-v0.2"
@@ -59,3 +58,13 @@ def validate_settings() -> None:
         raise ValueError(
             f"Missing required environment variables: {', '.join(missing)}"
         )
+
+
+def debug_settings() -> None:
+    print("GEMINI MODEL:", settings.GEMINI_MODEL)
+    print(
+        "GEMINI KEY PREFIX:",
+        settings.GEMINI_API_KEY[:12] if settings.GEMINI_API_KEY else "EMPTY",
+    )
+    print("GEMINI KEY LENGTH:", len(settings.GEMINI_API_KEY or ""))
+    print("HF ENABLED:", settings.HAS_HUGGINGFACE)

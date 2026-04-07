@@ -1,6 +1,5 @@
 from typing import Optional
 from urllib.parse import quote
-import os
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -8,6 +7,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         extra="ignore",
+        case_sensitive=True,
+        # add these only if you use a local .env file
+        # env_file=".env",
+        # env_file_encoding="utf-8",
     )
 
     # Azure DevOps
@@ -15,12 +18,9 @@ class Settings(BaseSettings):
     ADO_PROJECT: str = "Internal CRM"
     ADO_PAT: str = ""
 
-    # AI Model Configuration
-    GEMINI_API_KEY: str = ""
-    GEMINI_MODEL: str = "gemini-2.0-flash"
-
-    HF_API_TOKEN: str = ""
-    HF_MODEL: str = "mistralai/Mistral-7B-Instruct-v0.2"
+    # xAI / Grok
+    XAI_API_KEY: str = ""
+    GROK_MODEL: str = "grok-3-mini"
 
     # Optional Security
     WEBHOOK_SECRET: Optional[str] = None
@@ -31,15 +31,13 @@ class Settings(BaseSettings):
 
     @property
     def ADO_PROJECT_ENCODED(self) -> str:
-        return quote(self.ADO_PROJECT, safe="")
+        return quote((self.ADO_PROJECT or "").strip(), safe="")
 
     @property
-    def HAS_GEMINI(self) -> bool:
-        return bool(self.GEMINI_API_KEY.strip() and self.GEMINI_MODEL.strip())
-
-    @property
-    def HAS_HUGGINGFACE(self) -> bool:
-        return bool(self.HF_API_TOKEN.strip() and self.HF_MODEL.strip())
+    def HAS_GROK(self) -> bool:
+        return bool(
+            (self.XAI_API_KEY or "").strip() and (self.GROK_MODEL or "").strip()
+        )
 
 
 settings = Settings()
@@ -48,11 +46,11 @@ settings = Settings()
 def validate_settings() -> None:
     missing = []
 
-    if not settings.ADO_PAT:
+    if not (settings.ADO_PAT or "").strip():
         missing.append("ADO_PAT")
 
-    if not settings.HAS_GEMINI and not settings.HAS_HUGGINGFACE:
-        missing.append("GEMINI_API_KEY or HF_API_TOKEN")
+    if not settings.HAS_GROK:
+        missing.append("XAI_API_KEY")
 
     if missing:
         raise ValueError(
@@ -61,10 +59,13 @@ def validate_settings() -> None:
 
 
 def debug_settings() -> None:
-    print("GEMINI MODEL:", settings.GEMINI_MODEL)
+    print("ADO ORG URL:", settings.ADO_ORG_URL)
+    print("ADO PROJECT:", settings.ADO_PROJECT)
+    print("ADO PAT SET:", bool((settings.ADO_PAT or "").strip()))
+    print("GROK MODEL:", settings.GROK_MODEL)
     print(
-        "GEMINI KEY PREFIX:",
-        settings.GEMINI_API_KEY[:12] if settings.GEMINI_API_KEY else "EMPTY",
+        "XAI KEY PREFIX:",
+        settings.XAI_API_KEY[:12] if settings.XAI_API_KEY else "EMPTY",
     )
-    print("GEMINI KEY LENGTH:", len(settings.GEMINI_API_KEY or ""))
-    print("HF ENABLED:", settings.HAS_HUGGINGFACE)
+    print("XAI KEY LENGTH:", len(settings.XAI_API_KEY or ""))
+    print("GROK ENABLED:", settings.HAS_GROK)

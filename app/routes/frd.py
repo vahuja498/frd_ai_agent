@@ -116,8 +116,6 @@ async def generate_frd(
         frd_path = await frd_generator.generate_frd(
             work_item_id=wi_id,
             documents=documents,
-            project_name=project_name,
-            client_name=client_name or "",
         )
     except Exception as e:
         logger.error(f"FRD generation failed: {e}", exc_info=True)

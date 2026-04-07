@@ -87,10 +87,11 @@ class FRDGeneratorService:
                 ("proposed_solution", 750),
                 ("roles", 350),
                 ("application_types", 300),
-                ("modules_and_applications", 850),
-                ("process_flows", 700),
                 ("functional_requirements", 1100),
                 ("non_functional_requirements", 650),
+("modules_and_applications", 850),
+                ("process_flows", 700),
+                
                 ("integrations", 650),
                 ("notifications", 350),
                 ("reporting_visibility", 450),
@@ -120,7 +121,9 @@ class FRDGeneratorService:
                         combined_source=relevant_source,
                         max_output_tokens=max_tokens,
                     )
-
+                    # 🔥 ADD THIS (rate control)
+                    await asyncio.sleep(2.0)
+                    
                 except Exception as exc:
                     logger.warning(
                         "Section generation failed | work_item_id=%s | section=%s | error=%s",
@@ -601,32 +604,30 @@ Source Content:
     # Model calling — Grok only, with deterministic fallback
     # -------------------------------------------------------------------------
 
-    async def _call_model(
-        self,
-        prompt: str,
-        max_output_tokens: int = 1200,
-        temperature: float = 0.2,
-    ) -> str:
-        if self.xai_api_key:
-            try:
-                logger.info("Trying Grok | model=%s", self.grok_model)
-                text = await self._call_grok(
-                    prompt=prompt,
-                    max_output_tokens=max_output_tokens,
-                    temperature=temperature,
-                )
-                if text and text.strip():
-                    self._last_model_used = f"Grok ({self.grok_model})"
-                    return text.strip()
-            except Exception as exc:
-                logger.warning("Grok generation failed | error=%s", exc)
-        else:
-            logger.warning("XAI_API_KEY not configured — skipping Grok")
+        async def _call_model(
+            self,
+            prompt: str,
+            max_output_tokens: int = 1200,
+            temperature: float = 0.2,
+        ) -> str:
+            if self.xai_api_key:
+                try:
+                    logger.info("Trying Grok | model=%s", self.grok_model)
+                    text = await self._call_grok(
+                        prompt=prompt,
+                        max_output_tokens=max_output_tokens,
+                        temperature=temperature,
+                    )
+                    if text and text.strip():
+                        self._last_model_used = f"Grok ({self.grok_model})"
+                        return text.strip()
+                except Exception as exc:
+                    logger.warning("Grok failed after retries | error=%s", exc)
 
-        # Grok failed or not configured — deterministic fallback
-        self._last_model_used = "Deterministic Fallback"
-        logger.warning("Grok unavailable — using deterministic fallback")
-        return "Content could not be generated. Please review source documents."
+            # 🔴 ONLY fallback AFTER retries exhausted
+            self._last_model_used = "Deterministic Fallback"
+            logger.warning("Final fallback triggered")
+            return "Content could not be generated. Please review source documents."
 
     async def _call_grok(
         self,
@@ -655,10 +656,42 @@ Source Content:
             "temperature": temperature,
         }
 
-        async with httpx.AsyncClient(timeout=300) as client:
-            resp = await client.post(self.GROK_API_URL, json=payload, headers=headers)
+        retries = 3
 
-            if resp.status_code != 200:
+        async with httpx.AsyncClient(timeout=300) as client:
+            for attempt in range(retries):
+                resp = await client.post(self.GROK_API_URL, json=payload, headers=headers)
+
+                if resp.status_code == 200:
+                    data = resp.json()
+                    choices = data.get("choices") or []
+
+                    for choice in choices:
+                        message = choice.get("message") or {}
+                        content = message.get("content", "")
+                        if content and content.strip():
+                            logger.info("Grok success | chars=%s", len(content))
+                            return content.strip()
+
+                    logger.warning("Grok returned empty response")
+                    return ""
+
+                # 🔥 HANDLE RATE LIMIT
+                if resp.status_code == 429:
+                    body = resp.text
+                    logger.warning("Rate limited | attempt=%s | body=%s", attempt + 1, body[:300])
+
+                    wait = 2.0
+                    match = re.search(r"try again in\s+([0-9.]+)s", body, re.IGNORECASE)
+                    if match:
+                        wait = float(match.group(1)) + 0.5
+
+                    if attempt < retries - 1:
+                        logger.warning("Sleeping %ss before retry...", wait)
+                        await asyncio.sleep(wait)
+                        continue
+
+                # 🔴 HARD FAIL AFTER RETRIES
                 logger.error(
                     "Grok API error | status=%s | body=%s",
                     resp.status_code,
@@ -666,21 +699,6 @@ Source Content:
                 )
                 resp.raise_for_status()
 
-            data = resp.json()
-
-        choices = data.get("choices") or []
-        for choice in choices:
-            finish_reason = choice.get("finish_reason", "")
-            if finish_reason not in ("stop", "length", ""):
-                logger.warning("Grok unexpected finish_reason=%s", finish_reason)
-                continue
-            message = choice.get("message") or {}
-            content = message.get("content", "")
-            if content and content.strip():
-                logger.info("Grok success | chars=%s", len(content))
-                return content.strip()
-
-        logger.warning("Grok returned empty choices | response=%s", str(data)[:500])
         return ""
 
     def _parse_json_response(self, raw: str) -> Optional[Dict[str, Any]]:

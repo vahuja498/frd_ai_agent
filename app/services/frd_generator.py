@@ -66,45 +66,184 @@ class FRDGeneratorService:
         # Track which model generated the FRD
         self._last_model_used: str = "Unknown"
 
-    async def generate_frd(self, work_item_id: int, documents: List[Any]) -> Path:
-        if not documents:
-            raise ValueError("No source documents were provided for FRD generation.")
+        async def generate_frd(self, work_item_id: int, documents: List[Any]) -> Path:
+            if not documents:
+                raise ValueError("No source documents were provided for FRD generation.")
 
-        normalized_docs = self._normalize_documents(documents)
-        combined_source = self._combine_documents(normalized_docs)
+            normalized_docs = self._normalize_documents(documents)
+            combined_source = self._combine_documents(normalized_docs)
 
-        context = await self._extract_project_context(
-            work_item_id=work_item_id,
-            combined_source=combined_source,
-            documents=normalized_docs,
-        )
-
-        full_frd = await self._call_model(
-            prompt=self._build_full_frd_prompt(
+            context = await self._extract_project_context(
                 work_item_id=work_item_id,
+                combined_source=combined_source,
+                documents=normalized_docs,
+            )
+
+            sections: Dict[str, str] = {}
+
+            generation_plan = [
+                ("overview", 650),
+                ("current_state", 650),
+                ("proposed_solution", 750),
+                ("roles", 350),
+                ("application_types", 300),
+                ("modules_and_applications", 850),
+                ("process_flows", 700),
+                ("functional_requirements", 1100),
+                ("non_functional_requirements", 650),
+                ("integrations", 650),
+                ("notifications", 350),
+                ("reporting_visibility", 450),
+                ("gap_analysis", 550),
+                ("out_of_scope", 300),
+                ("assumptions_constraints", 450),
+                ("acceptance_signoff", 220),
+            ]
+
+            for section_name, max_tokens in generation_plan:
+                try:
+                    logger.info(
+                        "Generating FRD section | work_item_id=%s | section=%s",
+                        work_item_id,
+                        section_name,
+                    )
+
+                    relevant_source = self._get_section_relevant_source(
+                        section_name=section_name,
+                        combined_source=combined_source,
+                    )
+
+                    sections[section_name] = await self._generate_section(
+                        section_name=section_name,
+                        work_item_id=work_item_id,
+                        context=context,
+                        combined_source=relevant_source,
+                        max_output_tokens=max_tokens,
+                    )
+
+                except Exception as exc:
+                    logger.warning(
+                        "Section generation failed | work_item_id=%s | section=%s | error=%s",
+                        work_item_id,
+                        section_name,
+                        exc,
+                    )
+                    sections[section_name] = self._fallback_section(
+                        section_name=section_name,
+                        context=context,
+                        combined_source=combined_source,
+                    )
+
+            sections["document_history"] = self._fallback_section(
+                "document_history",
                 context=context,
                 combined_source=combined_source,
-            ),
-            max_output_tokens=4000,
-            temperature=0.25,
-        )
+            )
 
-        sections = {"full_frd": full_frd}
+            output_path = self._build_docx(
+                work_item_id=work_item_id,
+                context=context,
+                documents=normalized_docs,
+                sections=sections,
+            )
 
-        output_path = self._build_docx(
-            work_item_id=work_item_id,
-            context=context,
-            documents=normalized_docs,
-            sections=sections,
-        )
+            logger.info(
+                "FRD generated successfully | work_item_id=%s | model=%s | path=%s",
+                work_item_id,
+                self._last_model_used,
+                output_path,
+            )
+            return output_path
 
-        logger.info(
-            "FRD generated successfully | work_item_id=%s | model=%s | path=%s",
-            work_item_id,
-            self._last_model_used,
-            output_path,
-        )
-        return output_path
+
+        async def _generate_section(
+            self,
+            section_name: str,
+            work_item_id: int,
+            context: Dict[str, Any],
+            combined_source: str,
+            max_output_tokens: int = 800,
+        ) -> str:
+            section_instructions = self._section_instructions()
+            instruction = section_instructions[section_name]
+
+            prompt = f"""
+        You are a senior functional consultant writing a polished, client-ready Functional Requirements Document.
+
+        Write only the requested section content.
+        Do not add a section title or heading.
+        Do not mention that you are an AI.
+        Do not invent facts — only use what is in the source documents.
+        If information is unclear, explicitly state "To be confirmed" instead of guessing.
+        Use specific names, systems, fields, roles, and business processes from the source documents.
+        Prefer implementation-ready language.
+        Prefer markdown tables where requested.
+        Do not add generic filler text.
+
+        Work Item ID: {work_item_id}
+
+        Structured Context (extracted from source documents):
+        {json.dumps(context, indent=2)}
+
+        Relevant Source Content:
+        {self._truncate(combined_source, 5000)}
+
+        Section Instructions:
+        {instruction}
+        """.strip()
+
+            raw = await self._call_model(
+                prompt=prompt,
+                max_output_tokens=max_output_tokens,
+                temperature=0.2,
+            )
+            cleaned = self._clean_llm_output(raw)
+
+            if cleaned and len(cleaned) >= 40:
+                return cleaned
+
+            logger.warning(
+                "LLM section generation failed; using fallback | section=%s", section_name
+            )
+            return self._fallback_section(section_name, context, combined_source)
+
+
+        def _get_section_relevant_source(self, section_name: str, combined_source: str) -> str:
+            keyword_map = {
+                "overview": ["objective", "business", "solution", "project", "scope", "client"],
+                "current_state": ["current", "manual", "existing", "today", "pain", "issue", "challenge"],
+                "proposed_solution": ["proposed", "solution", "platform", "dynamics", "power automate", "power apps", "crm"],
+                "roles": ["role", "user", "admin", "reviewer", "field user", "executive", "pm"],
+                "application_types": ["power app", "model-driven", "canvas", "flow", "portal", "dashboard", "dynamics"],
+                "modules_and_applications": ["module", "screen", "ticket", "workflow", "dashboard", "email", "form"],
+                "process_flows": ["process", "flow", "step", "assignment", "escalation", "status", "approval"],
+                "functional_requirements": ["shall", "must", "ticket", "create", "assign", "status", "email", "integration", "workflow"],
+                "non_functional_requirements": ["pci", "uae", "security", "performance", "mobile", "hosting", "compliance", "access"],
+                "integrations": ["integration", "office 365", "email", "power automate", "internal ticketing", "api"],
+                "notifications": ["notification", "email", "alert", "assignment", "update", "escalation"],
+                "reporting_visibility": ["report", "dashboard", "metrics", "visibility", "resolution time", "customer satisfaction"],
+                "gap_analysis": ["gap", "confirm", "clarify", "tbc", "to be confirmed", "assumption", "dependency"],
+                "out_of_scope": ["out of scope", "not included", "excluded"],
+                "assumptions_constraints": ["assumption", "constraint", "license", "hosting", "dependency", "pci", "uae"],
+                "acceptance_signoff": ["approval", "sign-off", "review", "acceptance"],
+            }
+
+            keywords = keyword_map.get(section_name, [])
+            if not keywords:
+                return self._truncate(combined_source, 5000)
+
+            lines = [line.strip() for line in combined_source.splitlines() if line.strip()]
+            matched: List[str] = []
+
+            for line in lines:
+                low = line.lower()
+                if any(k in low for k in keywords):
+                    matched.append(line)
+
+            if not matched:
+                return self._truncate(combined_source, 5000)
+
+            return self._truncate("\n".join(matched), 5000)
 
     # -------------------------------------------------------------------------
     # Document preparation
@@ -120,7 +259,7 @@ class FRDGeneratorService:
             url = getattr(doc, "url", None)
 
             clean_content = self._clean_text(content)
-            clean_content = self._truncate(clean_content, 6000)
+            clean_content = self._truncate(clean_content, 7000)
 
             normalized.append(
                 {
@@ -347,150 +486,157 @@ Section Instructions:
     def _section_instructions(self) -> Dict[str, str]:
         return {
             "overview": """
-Write a professional executive overview (3-4 paragraphs) covering:
-- The specific business problem or opportunity this work item addresses
-- The client name and their industry or business context
-- What the proposed solution will do at a high level
-- Measurable expected outcomes (e.g. reduce ticket resolution time, eliminate manual steps, improve visibility)
-Be specific — use the actual client name, platform, and business context from the source documents.
-No generic filler sentences. Every sentence must be grounded in the source material.
-""",
+    Write a professional executive overview in 2-3 concise paragraphs covering:
+    - the specific business objective
+    - the client and business context
+    - the proposed solution at a high level
+    - expected business value
+
+    Be specific and grounded only in the source documents.
+    """,
             "document_history": """
-Return a short markdown table:
-| Date | Version | Description | Author |
-Include today's date as version 1.0 drafted by FRD AI Agent.
-""",
+    Return a short markdown table:
+    | Date | Version | Description | Author |
+    Include today's date as version 1.0 drafted by FRD AI Agent.
+    """,
             "current_state": """
-Based strictly on the source documents, describe:
-1. How the process currently works (step by step where possible)
-2. What systems or tools are currently used
-3. Specific pain points, delays, manual steps, or errors mentioned
-4. Who is affected and how
-Be specific. Only state what is supported by the source material.
-Do not use generic statements. Reference actual systems and teams from the documents.
-""",
+    Based strictly on the source documents, describe only what is explicitly supported.
+
+    Use these subheadings:
+    **Confirmed Current State**
+    **Pain Points**
+    **To Be Confirmed**
+
+    Do not guess the current state. If not described, clearly say what remains to be confirmed.
+    """,
             "proposed_solution": """
-Describe the future-state solution in concrete terms:
-- What platform or technology will be used (be specific — e.g. Dynamics 365, Power Automate, Azure)
-- What the core solution components are
-- How it addresses each pain point from the current state
-- What the user experience will look like
-Use business language. Be specific to this project. Reference actual systems from the source.
-""",
+    Describe the future-state solution in concrete terms:
+    - platform and technology stack
+    - major components
+    - how the solution addresses current pain points
+    - expected user experience
+
+    Use business language but keep it implementation-oriented.
+    """,
             "roles": """
-Return a markdown table:
-| Role | Responsibility |
-List the specific roles involved in this solution with clear, implementation-ready responsibilities.
-Use the actual role names and responsibilities from the source documents.
-""",
+    Return a markdown table:
+    | Role | Responsibility |
+    Use specific roles from the source documents.
+    """,
             "application_types": """
-Explain the specific solution components or application types required for this project.
-Examples: Model-Driven App, Power Automate Flows, Customer Portal, API Layer, Admin Configuration UI, Power BI Reporting.
-Only include what is grounded in the source documents.
-""",
+    List the solution application types/components required for this project.
+    Examples may include Model-Driven App, Power Automate Flows, Reporting Dashboard, Integration Layer.
+    Only include items supported by source content.
+    """,
             "modules_and_applications": """
-Break the solution into specific functional modules based on the source documents.
-For each module use this format:
+    Break the solution into specific functional modules.
 
-### [Module Name]
-**Purpose:** [specific purpose]
-**Users:** [specific user roles]
-**Core Features:**
-- [specific feature]
-**Key Fields:**
-- [field name]: [description and validation rules]
-**Business Rules:**
-- [specific rule]
+    For each module use this format:
 
-Only include modules directly supported by the source documents.
-Use real field names and business rules where mentioned.
-""",
+    ### [Module Name]
+    **Purpose:** [specific purpose]
+    **Users:** [specific user roles]
+    **Core Features:**
+    - [specific feature]
+    **Key Data / Fields:**
+    - [field or data point]
+    **Business Rules:**
+    - [specific rule]
+
+    Use only source-supported content.
+    """,
             "process_flows": """
-Document the main end-to-end process flows as numbered steps.
-For each major flow:
-1. Name the flow clearly
-2. List steps in format: [Actor] → [Action] → [System Response]
-3. Include decision points and exception/error paths
-Be specific to this project's actual described process, not generic steps.
-""",
+    Document the main process flows as numbered steps.
+
+    Format:
+    1. [Actor] → [Action] → [System Response]
+
+    Include decision points or escalation paths where supported by the source.
+    """,
             "functional_requirements": """
-Generate SPECIFIC, TESTABLE functional requirements directly derived from the source documents.
-Each requirement must reference actual business functionality, not generic placeholders.
+    Generate SPECIFIC, TESTABLE functional requirements directly derived from the source documents.
 
-Format exactly as:
-FR-001: The system shall [specific action] when [specific condition] so that [specific outcome].
+    Return a markdown table with these columns:
+    | ID | Module | Requirement | Acceptance Criteria |
 
-Example of BAD requirement: "The solution shall capture business data."
-Example of GOOD requirement: "The system shall automatically create a support ticket in Dynamics 365 when an inbound email is received at the configured support mailbox, capturing Subject, Sender Email, Body, and Received Timestamp as mandatory fields."
-
-Generate at least 15 strong, specific requirements grounded in the source documents.
-Each must be independently testable.
-""",
+    Rules:
+    - Use IDs FR-001, FR-002, etc.
+    - Each requirement must mention actor, trigger/condition, system behavior, and expected outcome
+    - Use actual business terms from the source
+    - Avoid generic statements
+    - Include at least 10 requirements, but only if supported by the source documents
+    - If a detail is unclear, mark it conservatively as 'To be confirmed'
+    """,
             "non_functional_requirements": """
-Generate non-functional requirements specific to this project's context.
-Include actual numbers and specifics where possible:
-- Performance: specific response time targets (e.g. "page load < 3 seconds for 95% of requests")
-- Security: specific auth mechanism (e.g. "Azure AD SSO", "MFA enforced for all users")
-- Compliance: specific standards mentioned in source (e.g. PCI DSS, GDPR, UAE data residency)
-- Availability: specific SLA target (e.g. "99.5% uptime during business hours")
-- Scalability: expected concurrent users or data volume
-- Auditability: what must be logged and retained
+    Generate non-functional requirements in a markdown table:
+    | ID | Category | Requirement |
 
-Format: NFR-001: [Category] — [specific measurable requirement]
-Generate at least 8 requirements.
-""",
+    Use IDs NFR-001, NFR-002, etc.
+
+    Focus on source-backed items such as:
+    - hosting/location
+    - security/access
+    - compliance
+    - performance
+    - device accessibility
+    - auditability
+    """,
             "integrations": """
-Describe all system integrations mentioned or clearly implied in the source documents.
-Use this markdown table:
-| System | Direction | Purpose | Data Exchanged | Trigger |
+    Describe integrations in a markdown table:
+    | System | Direction | Purpose | Data Exchanged | Trigger | Open Questions |
 
-For each integration be specific about what data moves and when.
-If details are unclear, state what needs to be confirmed and why it is needed.
-""",
+    Use only source-backed integrations.
+    If any detail is unclear, write 'To be confirmed'.
+    """,
             "notifications": """
-List specific notification events required by this solution:
-- Trigger condition
-- Recipient role
-- Channel (email / SMS / in-app / Teams)
-- Content summary
-Base this on the actual workflow described in the source documents.
-""",
+    List required notifications in a markdown table:
+    | Trigger | Recipient | Channel | Purpose |
+
+    Only include notifications supported by the source documents.
+    """,
             "reporting_visibility": """
-List specific reports, dashboards, and visibility requirements:
-- Report or dashboard name
-- Purpose and intended audience
-- Key metrics or fields displayed
-- Refresh frequency if relevant
-Be specific to this project's business needs.
-""",
+    List reports, dashboards, or visibility needs in a markdown table:
+    | Report / Dashboard | Audience | Purpose | Key Metrics |
+
+    Use only source-backed reporting needs.
+    """,
             "gap_analysis": """
-Identify real gaps between what the source documents specify and what is needed for a complete implementation.
-Use this markdown table:
-| Gap | Impact | Proposed Resolution | Owner | Phase |
+    Identify real implementation gaps or missing clarifications from the source documents.
 
-Only list genuine gaps found in the source material — missing field definitions, unclear business rules,
-unconfirmed integrations, missing sign-off criteria, etc.
-""",
+    Return a markdown table:
+    | Gap | Why It Matters | Proposed Resolution | Owner | Phase |
+
+    Focus on missing details such as:
+    - unclear field definitions
+    - unclear approvals/ownership
+    - integration ambiguity
+    - unclear escalation rules
+    - compliance/hosting confirmation
+    """,
             "out_of_scope": """
-List items explicitly stated as out of scope in the source documents.
-Also list items that are adjacent to the solution but not confirmed in scope.
-Be specific — reference actual features, systems, or integrations.
-""",
+    List items explicitly stated as out of scope.
+    If none are explicitly listed, include adjacent items that appear not yet confirmed in scope and mark them as 'To be confirmed'.
+    """,
             "assumptions_constraints": """
-**Assumptions:**
-- List each assumption with its implication if the assumption proves incorrect
+    Use this format:
 
-**Constraints:**
-- Technical constraints (platform version, hosting region, compliance)
-- Timeline or budget constraints mentioned
-- Integration or third-party dependency constraints
-""",
+    **Assumptions**
+    - [assumption]
+
+    **Constraints**
+    - [constraint]
+
+    Separate assumptions from constraints clearly and keep them source-grounded.
+    """,
             "acceptance_signoff": """
-Write a sign-off section including:
-- Brief description of the review and approval process
-- Sign-off table with roles specific to this project:
-| Name | Role | Signature | Date |
-""",
+    Write a concise sign-off section including:
+    - one short paragraph describing review/approval expectation
+    - a markdown table:
+
+    | Name | Role | Signature | Date |
+
+    Use project-relevant roles where possible; otherwise use placeholders conservatively.
+    """,
         }
 
     # -------------------------------------------------------------------------

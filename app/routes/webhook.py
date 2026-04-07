@@ -7,7 +7,7 @@ Prevents duplicate regeneration when an FRD is already attached.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 
@@ -33,11 +33,9 @@ def _extract_tags(payload: dict) -> list[str]:
         if not tags:
             continue
 
-        # CASE 1: direct string
         if isinstance(tags, str):
             return [t.strip().lower() for t in tags.split(";") if t.strip()]
 
-        # CASE 2: change object (oldValue/newValue)
         if isinstance(tags, dict):
             new_val = tags.get("newValue") or tags.get("oldValue")
             if isinstance(new_val, str):
@@ -94,7 +92,9 @@ async def handle_webhook(request: Request, background_tasks: BackgroundTasks):
         payload = await request.json()
     except Exception as exc:
         logger.exception(
-            "Invalid webhook JSON | request_id=%s | error=%s", request_id, exc
+            "Invalid webhook JSON | request_id=%s | error=%s",
+            request_id,
+            exc,
         )
         raise HTTPException(status_code=400, detail="Invalid JSON") from exc
 
@@ -102,7 +102,11 @@ async def handle_webhook(request: Request, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=400, detail="Invalid payload format")
 
     event_type = (payload.get("eventType") or "").strip().lower()
-    logger.info("Webhook event | request_id=%s | event_type=%s", request_id, event_type)
+    logger.info(
+        "Webhook event | request_id=%s | event_type=%s",
+        request_id,
+        event_type,
+    )
 
     if not _is_supported_event(payload):
         logger.info(
@@ -134,6 +138,7 @@ async def handle_webhook(request: Request, background_tasks: BackgroundTasks):
         )
         return {"status": "ignored", "reason": "missing_presales_tag"}
 
+    # BackgroundTasks supports async callables; keep the task small and fully self-contained.
     background_tasks.add_task(process_frd_pipeline, work_item_id, request_id)
 
     return {
@@ -144,7 +149,8 @@ async def handle_webhook(request: Request, background_tasks: BackgroundTasks):
 
 
 async def process_frd_pipeline(
-    work_item_id: int, request_id: str | None = None
+    work_item_id: int,
+    request_id: str | None = None,
 ) -> None:
     logger.info(
         "FRD pipeline started | request_id=%s | work_item_id=%s",
@@ -209,10 +215,12 @@ async def process_frd_pipeline(
         )
 
     except Exception as exc:
+        # IMPORTANT:
+        # Do not re-raise from a background task. Log the full failure and stop here.
         logger.exception(
             "FRD pipeline failed | request_id=%s | work_item_id=%s | error=%s",
             request_id,
             work_item_id,
             exc,
         )
-        raise
+        return

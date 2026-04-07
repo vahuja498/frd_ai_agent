@@ -1,15 +1,8 @@
-"""
-Work Item Service
-Interacts with Azure DevOps REST API to:
-- detect whether an FRD already exists
-- fetch and classify source attachments
-- upload the generated FRD back to the Work Item
-"""
-
 from __future__ import annotations
 
 import base64
 import logging
+import asyncio
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -23,32 +16,27 @@ logger = logging.getLogger(__name__)
 
 
 class WorkItemService:
-    SUPPORTED_EXTENSIONS = {
-        ".docx",
-        ".doc",
-        ".pdf",
-        ".txt",
-        ".md",
-        ".rtf",
-    }
-
+    SUPPORTED_EXTENSIONS = {".docx", ".doc", ".pdf", ".txt", ".md", ".rtf"}
     GENERATED_FRD_COMMENT = "Auto-generated FRD by FRD AI Agent"
 
+    MAX_RETRIES = 3
+    RETRY_DELAY = 2  # seconds
+
     def __init__(self) -> None:
-        self.org_url = (getattr(settings, "ADO_ORG_URL", "") or "").rstrip("/")
-        self.project = (getattr(settings, "ADO_PROJECT", "") or "").strip()
-        self.project_encoded = (
-            getattr(settings, "ADO_PROJECT_ENCODED", "") or self.project
-        )
-        self.pat = (getattr(settings, "ADO_PAT", "") or "").strip()
+        self.org_url = settings.ADO_ORG_URL.rstrip("/")
+        self.project = settings.ADO_PROJECT.strip()
+        self.project_encoded = settings.ADO_PROJECT_ENCODED
+        self.pat = settings.ADO_PAT.strip()
 
         self._validate_config()
         self._auth_header = self._build_auth_header()
         self.extractor = DocumentExtractor()
 
+    # -------------------------------
+    # Config
+    # -------------------------------
     def _validate_config(self) -> None:
         missing = []
-
         if not self.org_url:
             missing.append("ADO_ORG_URL")
         if not self.project:
@@ -57,54 +45,63 @@ class WorkItemService:
             missing.append("ADO_PAT")
 
         if missing:
-            raise ValueError(
-                f"Missing Azure DevOps configuration: {', '.join(missing)}"
-            )
+            raise ValueError(f"Missing Azure DevOps config: {', '.join(missing)}")
 
     def _build_auth_header(self) -> Dict[str, str]:
-        token = base64.b64encode(f":{self.pat}".encode("utf-8")).decode("utf-8")
+        token = base64.b64encode(f":{self.pat}".encode()).decode()
         return {
             "Authorization": f"Basic {token}",
             "Accept": "application/json",
         }
 
-    def _work_item_url(self, work_item_id: int, expand_relations: bool = False) -> str:
+    # -------------------------------
+    # HTTP RETRY WRAPPER
+    # -------------------------------
+    async def _request_with_retry(self, method, url, client, **kwargs):
+        for attempt in range(self.MAX_RETRIES):
+            try:
+                resp = await client.request(method, url, **kwargs)
+                resp.raise_for_status()
+                return resp
+            except Exception as e:
+                if attempt == self.MAX_RETRIES - 1:
+                    logger.exception("HTTP request failed after retries | url=%s", url)
+                    raise
+
+                logger.warning(
+                    "Retry %s/%s failed | url=%s | error=%s",
+                    attempt + 1,
+                    self.MAX_RETRIES,
+                    url,
+                    str(e),
+                )
+                await asyncio.sleep(self.RETRY_DELAY * (attempt + 1))
+
+    # -------------------------------
+    # URL BUILDERS
+    # -------------------------------
+    def _work_item_url(self, work_item_id: int, expand=False) -> str:
         suffix = "?api-version=7.1"
-        if expand_relations:
+        if expand:
             suffix = "?$expand=relations&api-version=7.1"
 
-        return (
-            f"{self.org_url}/{self.project_encoded}/_apis/wit/workitems/{work_item_id}"
-            f"{suffix}"
-        )
+        return f"{self.org_url}/{self.project_encoded}/_apis/wit/workitems/{work_item_id}{suffix}"
 
     def _attachment_upload_url(self, filename: str) -> str:
-        return (
-            f"{self.org_url}/{self.project_encoded}/_apis/wit/attachments"
-            f"?fileName={filename}&api-version=7.1"
-        )
+        return f"{self.org_url}/{self.project_encoded}/_apis/wit/attachments?fileName={filename}&api-version=7.1"
 
-    def _is_generated_frd_attachment(self, name: str, comment: str) -> bool:
-        low_name = (name or "").lower()
-        low_comment = (comment or "").lower()
-
-        if low_name.startswith("frd_wi") and low_name.endswith(".docx"):
-            return True
-        if self.GENERATED_FRD_COMMENT.lower() in low_comment:
-            return True
-        return False
-
+    # -------------------------------
+    # FRD EXISTS CHECK
+    # -------------------------------
     async def has_generated_frd(self, work_item_id: int) -> bool:
-        """
-        Returns True if an auto-generated FRD is already attached to the work item.
-        Prevents infinite loops and duplicate uploads.
-        """
-        async with httpx.AsyncClient(timeout=60) as client:
-            resp = await client.get(
-                self._work_item_url(work_item_id, expand_relations=True),
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await self._request_with_retry(
+                "GET",
+                self._work_item_url(work_item_id, expand=True),
+                client,
                 headers=self._auth_header,
             )
-            resp.raise_for_status()
+
             work_item = resp.json()
 
         for rel in work_item.get("relations", []) or []:
@@ -112,213 +109,100 @@ class WorkItemService:
                 continue
 
             attrs = rel.get("attributes", {}) or {}
-            name = attrs.get("name", "")
-            comment = attrs.get("comment", "")
+            name = attrs.get("name", "").lower()
+            comment = attrs.get("comment", "").lower()
 
-            if self._is_generated_frd_attachment(name=name, comment=comment):
+            if (
+                name.startswith("frd_wi")
+                or self.GENERATED_FRD_COMMENT.lower() in comment
+            ):
                 return True
 
         return False
 
+    # -------------------------------
+    # FETCH DOCUMENTS
+    # -------------------------------
     async def fetch_work_item_documents(
         self, work_item_id: int
     ) -> List[WorkItemDocument]:
-        """
-        Fetches supported attachments from the work item and extracts text content.
-        Unsupported files are skipped.
-        """
         documents: List[WorkItemDocument] = []
 
-        async with httpx.AsyncClient(timeout=90) as client:
-            work_item_resp = await client.get(
-                self._work_item_url(work_item_id, expand_relations=True),
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await self._request_with_retry(
+                "GET",
+                self._work_item_url(work_item_id, expand=True),
+                client,
                 headers=self._auth_header,
             )
-            work_item_resp.raise_for_status()
-            work_item = work_item_resp.json()
 
+            work_item = resp.json()
             relations = work_item.get("relations", []) or []
-            logger.info(
-                "Fetched work item relations | work_item_id=%s | relation_count=%s",
-                work_item_id,
-                len(relations),
-            )
 
             for relation in relations:
                 if relation.get("rel") != "AttachedFile":
                     continue
 
-                attrs = relation.get("attributes", {}) or {}
+                attrs = relation.get("attributes", {})
                 filename = attrs.get("name", "unknown.bin")
-                comment = attrs.get("comment", "")
-                attachment_url = relation.get("url")
-
-                if self._is_generated_frd_attachment(filename, comment):
-                    logger.info(
-                        "Skipping generated FRD attachment | work_item_id=%s | filename=%s",
-                        work_item_id,
-                        filename,
-                    )
-                    continue
-
-                if not attachment_url:
-                    logger.warning(
-                        "Skipping attachment with missing url | work_item_id=%s | filename=%s",
-                        work_item_id,
-                        filename,
-                    )
-                    continue
+                url = relation.get("url")
 
                 ext = Path(filename).suffix.lower()
                 if ext not in self.SUPPORTED_EXTENSIONS:
-                    logger.info(
-                        "Skipping unsupported attachment | work_item_id=%s | filename=%s | extension=%s",
-                        work_item_id,
-                        filename,
-                        ext,
-                    )
                     continue
 
                 try:
-                    file_resp = await client.get(
-                        attachment_url, headers=self._auth_header
+                    file_resp = await self._request_with_retry(
+                        "GET", url, client, headers=self._auth_header
                     )
-                    file_resp.raise_for_status()
+
                     content_bytes = file_resp.content
+                    text = self.extractor.extract_text(filename, content_bytes).strip()
 
-                    text_content = self.extractor.extract_text(filename, content_bytes)
-                    text_content = (text_content or "").strip()
-
-                    if not text_content:
-                        logger.warning(
-                            "Skipping empty extracted document | work_item_id=%s | filename=%s",
-                            work_item_id,
-                            filename,
-                        )
+                    if not text:
                         continue
-
-                    doc_type = self._classify_document(filename, text_content)
 
                     documents.append(
                         WorkItemDocument(
                             filename=filename,
-                            content=text_content,
-                            doc_type=doc_type,
-                            url=attachment_url,
+                            content=text,
+                            doc_type=self._classify_document(filename, text),
+                            url=url,
                         )
                     )
 
-                    logger.info(
-                        "Attachment processed | work_item_id=%s | filename=%s | doc_type=%s | chars=%s",
+                except Exception:
+                    logger.exception(
+                        "Failed to process attachment | work_item_id=%s | file=%s",
                         work_item_id,
                         filename,
-                        doc_type,
-                        len(text_content),
                     )
 
-                except Exception as exc:
-                    logger.warning(
-                        "Failed to process attachment | work_item_id=%s | filename=%s | error=%s",
-                        work_item_id,
-                        filename,
-                        exc,
-                    )
+        return sorted(documents, key=lambda d: self._doc_type_rank(d.doc_type))
 
-        documents.sort(
-            key=lambda d: self._doc_type_rank(getattr(d, "doc_type", "other"))
-        )
-        return documents
-
-    def _doc_type_rank(self, doc_type: str) -> int:
-        order = {
-            "sow": 0,
-            "mom": 1,
-            "transcript": 2,
-            "other": 3,
-        }
-        return order.get((doc_type or "other").lower(), 9)
-
-    def _classify_document(self, filename: str, content: str) -> str:
-        name_lower = (filename or "").lower()
-        content_lower = (content or "").lower()
-
-        if any(
-            k in name_lower for k in ["sow", "statement_of_work", "statement-of-work"]
-        ):
-            return "sow"
-        if any(k in name_lower for k in ["mom", "minutes", "meeting"]):
-            return "mom"
-        if any(k in name_lower for k in ["transcript", "recording", "call"]):
-            return "transcript"
-
-        sow_keywords = [
-            "scope of work",
-            "deliverables",
-            "statement of work",
-            "project scope",
-            "solution scope",
-        ]
-        mom_keywords = [
-            "minutes of meeting",
-            "action items",
-            "attendees",
-            "discussion points",
-            "next steps",
-        ]
-        transcript_keywords = [
-            "transcript",
-            "[00:",
-            "speaker",
-            "host:",
-            "participant",
-        ]
-
-        sow_score = sum(1 for k in sow_keywords if k in content_lower)
-        mom_score = sum(1 for k in mom_keywords if k in content_lower)
-        transcript_score = sum(1 for k in transcript_keywords if k in content_lower)
-
-        max_score = max(sow_score, mom_score, transcript_score)
-        if max_score <= 0:
-            return "other"
-        if sow_score == max_score:
-            return "sow"
-        if mom_score == max_score:
-            return "mom"
-        return "transcript"
-
+    # -------------------------------
+    # UPLOAD FRD
+    # -------------------------------
     async def upload_frd_to_work_item(self, work_item_id: int, frd_path: Path) -> None:
-        """
-        Uploads the generated FRD .docx as an Azure DevOps attachment
-        and links it to the Work Item.
-        """
         if not frd_path.exists():
             raise FileNotFoundError(f"FRD file not found: {frd_path}")
 
-        file_name = frd_path.name
+        async with httpx.AsyncClient(timeout=60) as client:
+            with open(frd_path, "rb") as f:
+                data = f.read()
 
-        async with httpx.AsyncClient(timeout=90) as client:
-            with open(frd_path, "rb") as file_obj:
-                file_data = file_obj.read()
-
-            upload_headers = {
-                **self._auth_header,
-                "Content-Type": "application/octet-stream",
-            }
-
-            upload_resp = await client.post(
-                self._attachment_upload_url(file_name),
-                headers=upload_headers,
-                content=file_data,
+            upload_resp = await self._request_with_retry(
+                "POST",
+                self._attachment_upload_url(frd_path.name),
+                client,
+                headers={
+                    **self._auth_header,
+                    "Content-Type": "application/octet-stream",
+                },
+                content=data,
             )
-            upload_resp.raise_for_status()
 
-            attachment = upload_resp.json()
-            attachment_url = attachment["url"]
-
-            patch_headers = {
-                **self._auth_header,
-                "Content-Type": "application/json-patch+json",
-            }
+            attachment_url = upload_resp.json()["url"]
 
             patch_body = [
                 {
@@ -329,21 +213,40 @@ class WorkItemService:
                         "url": attachment_url,
                         "attributes": {
                             "comment": self.GENERATED_FRD_COMMENT,
-                            "name": file_name,
+                            "name": frd_path.name,
                         },
                     },
                 }
             ]
 
-            patch_resp = await client.patch(
-                self._work_item_url(work_item_id, expand_relations=False),
-                headers=patch_headers,
+            await self._request_with_retry(
+                "PATCH",
+                self._work_item_url(work_item_id),
+                client,
+                headers={
+                    **self._auth_header,
+                    "Content-Type": "application/json-patch+json",
+                },
                 json=patch_body,
             )
-            patch_resp.raise_for_status()
 
-        logger.info(
-            "FRD uploaded and linked | work_item_id=%s | file_name=%s",
-            work_item_id,
-            file_name,
-        )
+        logger.info("FRD uploaded successfully | work_item_id=%s", work_item_id)
+
+    # -------------------------------
+    # HELPERS
+    # -------------------------------
+    def _doc_type_rank(self, doc_type: str) -> int:
+        return {"sow": 0, "mom": 1, "transcript": 2}.get(doc_type, 9)
+
+    def _classify_document(self, filename: str, content: str) -> str:
+        name = filename.lower()
+        content = content.lower()
+
+        if "sow" in name:
+            return "sow"
+        if "mom" in name:
+            return "mom"
+        if "transcript" in name:
+            return "transcript"
+
+        return "other"

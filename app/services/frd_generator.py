@@ -604,7 +604,7 @@ Source Content:
     # Model calling — Grok only, with deterministic fallback
     # -------------------------------------------------------------------------
 
-        async def _call_model(
+    async def _call_model(
             self,
             prompt: str,
             max_output_tokens: int = 1200,

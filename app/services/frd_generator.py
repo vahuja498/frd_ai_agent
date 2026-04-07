@@ -2,9 +2,8 @@
 FRD Generator Service
 
 Generation strategy:
-1. Try Gemini first
-2. If Gemini fails, try Hugging Face
-3. If both fail, generate a strong deterministic fallback FRD
+1. Try Grok (xAI) first
+2. If Grok fails, generate a strong deterministic fallback FRD
 
 The service always returns a non-empty, professionally structured DOCX.
 """
@@ -25,7 +24,6 @@ from docx import Document
 from docx.enum.table import WD_TABLE_ALIGNMENT
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.shared import Inches, Pt
-from huggingface_hub import InferenceClient
 
 from app.config import settings
 
@@ -53,25 +51,17 @@ class FRDGeneratorService:
         "acceptance_signoff",
     ]
 
+    # xAI Grok API endpoint
+    GROK_API_URL = "https://api.x.ai/v1/chat/completions"
+
     def __init__(self) -> None:
         self.output_dir = Path(getattr(settings, "OUTPUT_DIR", "outputs"))
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        self.gemini_api_key = (getattr(settings, "GEMINI_API_KEY", "") or "").strip()
-        self.gemini_model = (
-            getattr(settings, "GEMINI_MODEL", "") or "gemini-2.5-flash"
-        ).strip()
+        self.xai_api_key = (getattr(settings, "XAI_API_KEY", "") or "").strip()
+        self.grok_model = (getattr(settings, "GROK_MODEL", "") or "grok-3-mini").strip()
 
-        self.hf_api_token = (getattr(settings, "HF_API_TOKEN", "") or "").strip()
-        self.hf_model = (
-            getattr(settings, "HF_MODEL", "") or "mistralai/Mistral-7B-Instruct-v0.3"
-        ).strip()
-
-        self.hf_client: Optional[InferenceClient] = None
-        if self.hf_api_token:
-            self.hf_client = InferenceClient(api_key=self.hf_api_token)
-
-        # FIX: Track which model generated the FRD
+        # Track which model generated the FRD
         self._last_model_used: str = "Unknown"
 
     async def generate_frd(self, work_item_id: int, documents: List[Any]) -> Path:
@@ -502,7 +492,7 @@ Write a sign-off section including:
         }
 
     # -------------------------------------------------------------------------
-    # Model calling chain
+    # Model calling — Grok only, with deterministic fallback
     # -------------------------------------------------------------------------
 
     async def _call_model(
@@ -511,72 +501,60 @@ Write a sign-off section including:
         max_output_tokens: int = 1200,
         temperature: float = 0.2,
     ) -> str:
-        # FIX: Try Gemini first with full error visibility
-        if self.gemini_api_key:
+        if self.xai_api_key:
             try:
-                logger.info("Trying Gemini | model=%s", self.gemini_model)
-                text = await self._call_gemini(
+                logger.info("Trying Grok | model=%s", self.grok_model)
+                text = await self._call_grok(
                     prompt=prompt,
                     max_output_tokens=max_output_tokens,
                     temperature=temperature,
                 )
                 if text and text.strip():
-                    self._last_model_used = f"Gemini ({self.gemini_model})"
+                    self._last_model_used = f"Grok ({self.grok_model})"
                     return text.strip()
             except Exception as exc:
-                logger.warning("Gemini generation failed | error=%s", exc)
+                logger.warning("Grok generation failed | error=%s", exc)
+        else:
+            logger.warning("XAI_API_KEY not configured — skipping Grok")
 
-        # FIX: Try HuggingFace with async-safe call
-        if self.hf_client and self.hf_api_token:
-            try:
-                logger.info("Trying HuggingFace | model=%s", self.hf_model)
-                text = await self._call_huggingface(
-                    prompt=prompt,
-                    max_output_tokens=max_output_tokens,
-                    temperature=temperature,
-                )
-                if text and text.strip():
-                    self._last_model_used = f"HuggingFace ({self.hf_model})"
-                    return text.strip()
-            except Exception as exc:
-                logger.warning("HuggingFace generation failed | error=%s", exc)
-
-        # Both failed — deterministic fallback
+        # Grok failed or not configured — deterministic fallback
         self._last_model_used = "Deterministic Fallback"
-        logger.warning("All model providers failed — using deterministic fallback")
+        logger.warning("Grok unavailable — using deterministic fallback")
         return "Content could not be generated. Please review source documents."
 
-    async def _call_gemini(
+    async def _call_grok(
         self,
         prompt: str,
         max_output_tokens: int,
         temperature: float,
     ) -> str:
-        # FIX: Use safe default model name
-        model = self.gemini_model or "gemini-2.5-flash"
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-
         headers = {
             "Content-Type": "application/json",
-            "x-goog-api-key": self.gemini_api_key,
+            "Authorization": f"Bearer {self.xai_api_key}",
         }
 
         payload = {
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {
-                "temperature": temperature,
-                "maxOutputTokens": max_output_tokens,
-                "topP": 0.95,
-            },
+            "model": self.grok_model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a senior business analyst writing implementation-ready "
+                        "functional requirements documentation."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+            "max_tokens": max_output_tokens,
+            "temperature": temperature,
         }
 
         async with httpx.AsyncClient(timeout=300) as client:
-            resp = await client.post(url, json=payload, headers=headers)
+            resp = await client.post(self.GROK_API_URL, json=payload, headers=headers)
 
-            # FIX: Log full error body so failures are visible in Azure logs
             if resp.status_code != 200:
                 logger.error(
-                    "Gemini API error | status=%s | body=%s",
+                    "Grok API error | status=%s | body=%s",
                     resp.status_code,
                     resp.text[:1000],
                 )
@@ -584,72 +562,19 @@ Write a sign-off section including:
 
             data = resp.json()
 
-        # FIX: Check for prompt blocking
-        if data.get("promptFeedback", {}).get("blockReason"):
-            logger.warning(
-                "Gemini blocked prompt | reason=%s",
-                data["promptFeedback"]["blockReason"],
-            )
-            return ""
-
-        candidates = data.get("candidates", []) or []
-        for candidate in candidates:
-            # FIX: Check finish reason before using response
-            finish_reason = candidate.get("finishReason", "")
-            if finish_reason not in ("STOP", "MAX_TOKENS", ""):
-                logger.warning("Gemini unexpected finishReason=%s", finish_reason)
+        choices = data.get("choices") or []
+        for choice in choices:
+            finish_reason = choice.get("finish_reason", "")
+            if finish_reason not in ("stop", "length", ""):
+                logger.warning("Grok unexpected finish_reason=%s", finish_reason)
                 continue
-            content = candidate.get("content", {}) or {}
-            parts = content.get("parts", []) or []
-            text_parts = [p.get("text", "") for p in parts if p.get("text")]
-            if text_parts:
-                result = "\n".join(text_parts).strip()
-                logger.info("Gemini success | chars=%s", len(result))
-                return result
-
-        logger.warning(
-            "Gemini returned empty candidates | response=%s", str(data)[:500]
-        )
-        return ""
-
-    async def _call_huggingface(
-        self,
-        prompt: str,
-        max_output_tokens: int,
-        temperature: float,
-    ) -> str:
-        assert self.hf_client is not None
-
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are a senior business analyst writing implementation-ready "
-                    "functional requirements documentation."
-                ),
-            },
-            {"role": "user", "content": prompt},
-        ]
-
-        # FIX: Run blocking HuggingFace call in thread pool to avoid blocking async event loop
-        def _sync_call():
-            return self.hf_client.chat_completion(
-                model=self.hf_model,
-                messages=messages,
-                max_tokens=max_output_tokens,
-                temperature=max(temperature, 0.01),  # HF requires temperature > 0
-            )
-
-        loop = asyncio.get_event_loop()
-        completion = await loop.run_in_executor(None, _sync_call)
-
-        if completion and getattr(completion, "choices", None):
-            message = completion.choices[0].message
-            content = getattr(message, "content", None)
-            if isinstance(content, str) and content.strip():
-                logger.info("HuggingFace success | chars=%s", len(content))
+            message = choice.get("message") or {}
+            content = message.get("content", "")
+            if content and content.strip():
+                logger.info("Grok success | chars=%s", len(content))
                 return content.strip()
 
+        logger.warning("Grok returned empty choices | response=%s", str(data)[:500])
         return ""
 
     def _parse_json_response(self, raw: str) -> Optional[Dict[str, Any]]:

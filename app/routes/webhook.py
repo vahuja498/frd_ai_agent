@@ -157,57 +157,58 @@ async def process_frd_pipeline(
         work_item_id,
     )
 
-    work_item_service = WorkItemService()
-    frd_generator = FRDGeneratorService()
-
     try:
-        logger.info("STEP 1: Checking for existing FRD | work_item_id=%s", work_item_id)
+        logger.info(
+            "STEP 0 START | init WorkItemService | work_item_id=%s", work_item_id
+        )
+        work_item_service = WorkItemService()
+        logger.info("STEP 0 OK | init WorkItemService | work_item_id=%s", work_item_id)
+
+        logger.info(
+            "STEP 0 START | init FRDGeneratorService | work_item_id=%s", work_item_id
+        )
+        frd_generator = FRDGeneratorService()
+        logger.info(
+            "STEP 0 OK | init FRDGeneratorService | work_item_id=%s", work_item_id
+        )
+
+        logger.info("STEP 1 START | has_generated_frd | work_item_id=%s", work_item_id)
         already_exists = await work_item_service.has_generated_frd(work_item_id)
         logger.info(
-            "STEP 1 OK | work_item_id=%s | already_exists=%s",
-            work_item_id,
+            "STEP 1 OK | already_exists=%s | work_item_id=%s",
             already_exists,
+            work_item_id,
         )
 
         if already_exists:
             logger.info(
-                "Skipping generation because FRD already exists | request_id=%s | work_item_id=%s",
-                request_id,
-                work_item_id,
+                "STEP 1 EXIT | FRD already exists | work_item_id=%s", work_item_id
             )
             return
 
         logger.info(
-            "STEP 2: Fetching work item documents | work_item_id=%s", work_item_id
+            "STEP 2 START | fetch_work_item_documents | work_item_id=%s", work_item_id
         )
         documents = await work_item_service.fetch_work_item_documents(work_item_id)
         logger.info(
-            "STEP 2 OK | work_item_id=%s | document_count=%s",
-            work_item_id,
+            "STEP 2 OK | document_count=%s | work_item_id=%s",
             len(documents),
+            work_item_id,
         )
 
         if not documents:
-            logger.warning(
-                "No usable documents found; skipping generation | request_id=%s | work_item_id=%s",
-                request_id,
-                work_item_id,
-            )
+            logger.warning("STEP 2 EXIT | no documents | work_item_id=%s", work_item_id)
             return
 
-        logger.info("STEP 3: Generating FRD | work_item_id=%s", work_item_id)
+        logger.info("STEP 3 START | generate_frd | work_item_id=%s", work_item_id)
         frd_path = await frd_generator.generate_frd(
             work_item_id=work_item_id,
             documents=documents,
         )
-        logger.info(
-            "STEP 3 OK | work_item_id=%s | frd_path=%s",
-            work_item_id,
-            frd_path,
-        )
+        logger.info("STEP 3 OK | frd_path=%s | work_item_id=%s", frd_path, work_item_id)
 
         logger.info(
-            "STEP 4: Uploading FRD to work item | work_item_id=%s", work_item_id
+            "STEP 4 START | upload_frd_to_work_item | work_item_id=%s", work_item_id
         )
         await work_item_service.upload_frd_to_work_item(work_item_id, frd_path)
         logger.info("STEP 4 OK | work_item_id=%s", work_item_id)
@@ -220,7 +221,7 @@ async def process_frd_pipeline(
 
     except Exception as exc:
         logger.exception(
-            "FRD pipeline failed | request_id=%s | work_item_id=%s | error=%s",
+            "FRD pipeline failed | request_id=%s | work_item_id=%s | error=%r",
             request_id,
             work_item_id,
             exc,

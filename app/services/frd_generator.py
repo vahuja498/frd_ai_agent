@@ -439,49 +439,7 @@ Source Content:
         )
         return self._fallback_context(work_item_id, documents, combined_source)
 
-    async def _generate_section(
-        self,
-        section_name: str,
-        work_item_id: int,
-        context: Dict[str, Any],
-        combined_source: str,
-    ) -> str:
-        section_instructions = self._section_instructions()
-        instruction = section_instructions[section_name]
-
-        prompt = f"""
-You are a senior functional consultant writing a polished, client-ready Functional Requirements Document.
-
-Write only the requested section content.
-Do not add a section title or heading.
-Do not mention that you are an AI.
-Do not invent facts — only use what is in the source documents.
-Use "To be confirmed" only where information is genuinely unavailable.
-Use specific names, systems, fields, and processes from the source documents.
-Prefer implementation-ready language. Use markdown lists or markdown tables where appropriate.
-
-Work Item ID: {work_item_id}
-
-Structured Context (extracted from source documents):
-{json.dumps(context, indent=2)}
-
-Full Source Content:
-{self._truncate(combined_source, 20000)}
-
-Section Instructions:
-{instruction}
-""".strip()
-
-        raw = await self._call_model(prompt, max_output_tokens=1600, temperature=0.25)
-        cleaned = self._clean_llm_output(raw)
-
-        if cleaned and len(cleaned) >= 40:
-            return cleaned
-
-        logger.warning(
-            "LLM section generation failed; using fallback | section=%s", section_name
-        )
-        return self._fallback_section(section_name, context, combined_source)
+    
 
     def _section_instructions(self) -> Dict[str, str]:
         return {

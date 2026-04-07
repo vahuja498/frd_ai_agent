@@ -20,7 +20,7 @@ class Settings(BaseSettings):
 
     # xAI / Grok
     XAI_API_KEY: str = ""
-    GROK_MODEL: str = "grok-3-mini"
+    GROK_MODEL: str = "llama-3.3-70b-versatile"
 
     # Optional Security
     WEBHOOK_SECRET: Optional[str] = None

@@ -208,42 +208,42 @@ class FRDGeneratorService:
             return self._fallback_section(section_name, context, combined_source)
 
 
-    async def _get_section_relevant_source(self, section_name: str, combined_source: str) -> str:
-            keyword_map = {
-                "overview": ["objective", "business", "solution", "project", "scope", "client"],
-                "current_state": ["current", "manual", "existing", "today", "pain", "issue", "challenge"],
-                "proposed_solution": ["proposed", "solution", "platform", "dynamics", "power automate", "power apps", "crm"],
-                "roles": ["role", "user", "admin", "reviewer", "field user", "executive", "pm"],
-                "application_types": ["power app", "model-driven", "canvas", "flow", "portal", "dashboard", "dynamics"],
-                "modules_and_applications": ["module", "screen", "ticket", "workflow", "dashboard", "email", "form"],
-                "process_flows": ["process", "flow", "step", "assignment", "escalation", "status", "approval"],
-                "functional_requirements": ["shall", "must", "ticket", "create", "assign", "status", "email", "integration", "workflow"],
-                "non_functional_requirements": ["pci", "uae", "security", "performance", "mobile", "hosting", "compliance", "access"],
-                "integrations": ["integration", "office 365", "email", "power automate", "internal ticketing", "api"],
-                "notifications": ["notification", "email", "alert", "assignment", "update", "escalation"],
-                "reporting_visibility": ["report", "dashboard", "metrics", "visibility", "resolution time", "customer satisfaction"],
-                "gap_analysis": ["gap", "confirm", "clarify", "tbc", "to be confirmed", "assumption", "dependency"],
-                "out_of_scope": ["out of scope", "not included", "excluded"],
-                "assumptions_constraints": ["assumption", "constraint", "license", "hosting", "dependency", "pci", "uae"],
-                "acceptance_signoff": ["approval", "sign-off", "review", "acceptance"],
-            }
+    def _get_section_relevant_source(self, section_name: str, combined_source: str) -> str:
+        keyword_map = {
+            "overview": ["objective", "business", "solution", "project", "scope", "client"],
+            "current_state": ["current", "manual", "existing", "today", "pain", "issue", "challenge"],
+            "proposed_solution": ["proposed", "solution", "platform", "dynamics", "power automate", "power apps", "crm"],
+            "roles": ["role", "user", "admin", "reviewer", "field user", "executive", "pm"],
+            "application_types": ["power app", "model-driven", "canvas", "flow", "portal", "dashboard", "dynamics"],
+            "modules_and_applications": ["module", "screen", "ticket", "workflow", "dashboard", "email", "form"],
+            "process_flows": ["process", "flow", "step", "assignment", "escalation", "status", "approval"],
+            "functional_requirements": ["shall", "must", "ticket", "create", "assign", "status", "email", "integration", "workflow"],
+            "non_functional_requirements": ["pci", "uae", "security", "performance", "mobile", "hosting", "compliance", "access"],
+            "integrations": ["integration", "office 365", "email", "power automate", "internal ticketing", "api"],
+            "notifications": ["notification", "email", "alert", "assignment", "update", "escalation"],
+            "reporting_visibility": ["report", "dashboard", "metrics", "visibility", "resolution time", "customer satisfaction"],
+            "gap_analysis": ["gap", "confirm", "clarify", "tbc", "to be confirmed", "assumption", "dependency"],
+            "out_of_scope": ["out of scope", "not included", "excluded"],
+            "assumptions_constraints": ["assumption", "constraint", "license", "hosting", "dependency", "pci", "uae"],
+            "acceptance_signoff": ["approval", "sign-off", "review", "acceptance"],
+        }
 
-            keywords = keyword_map.get(section_name, [])
-            if not keywords:
-                return self._truncate(combined_source, 5000)
+        keywords = keyword_map.get(section_name, [])
+        if not keywords:
+            return self._truncate(combined_source, 5000)
 
-            lines = [line.strip() for line in combined_source.splitlines() if line.strip()]
-            matched: List[str] = []
+        lines = [line.strip() for line in combined_source.splitlines() if line.strip()]
+        matched: List[str] = []
 
-            for line in lines:
-                low = line.lower()
-                if any(k in low for k in keywords):
-                    matched.append(line)
+        for line in lines:
+            low = line.lower()
+            if any(k in low for k in keywords):
+                matched.append(line)
 
-            if not matched:
-                return self._truncate(combined_source, 5000)
+        if not matched:
+            return self._truncate(combined_source, 5000)
 
-            return self._truncate("\n".join(matched), 5000)
+        return self._truncate("\n".join(matched), 5000)
 
     # -------------------------------------------------------------------------
     # Document preparation

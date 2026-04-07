@@ -59,7 +59,9 @@ class FRDGeneratorService:
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         self.xai_api_key = (getattr(settings, "XAI_API_KEY", "") or "").strip()
-        self.grok_model = (getattr(settings, "GROK_MODEL", "") or "llama-3.3-70b-versatile").strip()
+        self.grok_model = (
+            getattr(settings, "GROK_MODEL", "") or "llama-3.3-70b-versatile"
+        ).strip()
 
         # Track which model generated the FRD
         self._last_model_used: str = "Unknown"
@@ -118,7 +120,7 @@ class FRDGeneratorService:
             url = getattr(doc, "url", None)
 
             clean_content = self._clean_text(content)
-            clean_content = self._truncate(clean_content, 18000)
+            clean_content = self._truncate(clean_content, 6000)
 
             normalized.append(
                 {
@@ -187,7 +189,7 @@ Content:
 """
             )
 
-        return self._truncate("\n\n".join(parts).strip(), 50000)
+        return self._truncate("\n\n".join(parts).strip(), 18000)
 
     def _clean_text(self, text: str) -> str:
         text = unescape(text or "")
@@ -287,7 +289,7 @@ Source Content:
 {combined_source}
 """.strip()
 
-        raw = await self._call_model(prompt, max_output_tokens=2200, temperature=0.2)
+        raw = await self._call_model(prompt, max_output_tokens=900, temperature=0.2)
         parsed = self._parse_json_response(raw)
 
         if parsed:

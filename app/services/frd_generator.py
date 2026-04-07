@@ -66,7 +66,7 @@ class FRDGeneratorService:
         # Track which model generated the FRD
         self._last_model_used: str = "Unknown"
 
-        async def generate_frd(self, work_item_id: int, documents: List[Any]) -> Path:
+    async def generate_frd(self, work_item_id: int, documents: List[Any]) -> Path:
             if not documents:
                 raise ValueError("No source documents were provided for FRD generation.")
 
@@ -156,7 +156,7 @@ class FRDGeneratorService:
             return output_path
 
 
-        async def _generate_section(
+    async def _generate_section(
             self,
             section_name: str,
             work_item_id: int,
@@ -208,7 +208,7 @@ class FRDGeneratorService:
             return self._fallback_section(section_name, context, combined_source)
 
 
-        def _get_section_relevant_source(self, section_name: str, combined_source: str) -> str:
+    async def _get_section_relevant_source(self, section_name: str, combined_source: str) -> str:
             keyword_map = {
                 "overview": ["objective", "business", "solution", "project", "scope", "client"],
                 "current_state": ["current", "manual", "existing", "today", "pain", "issue", "challenge"],

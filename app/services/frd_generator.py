@@ -52,14 +52,14 @@ class FRDGeneratorService:
     ]
 
     # xAI Grok API endpoint
-    GROK_API_URL = "https://api.x.ai/v1/chat/completions"
+    GROK_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
     def __init__(self) -> None:
         self.output_dir = Path(getattr(settings, "OUTPUT_DIR", "outputs"))
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         self.xai_api_key = (getattr(settings, "XAI_API_KEY", "") or "").strip()
-        self.grok_model = (getattr(settings, "GROK_MODEL", "") or "grok-3-mini").strip()
+        self.grok_model = (getattr(settings, "GROK_MODEL", "") or "llama-3.3-70b-versatile").strip()
 
         # Track which model generated the FRD
         self._last_model_used: str = "Unknown"

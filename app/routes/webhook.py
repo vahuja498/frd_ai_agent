@@ -149,8 +149,7 @@ async def handle_webhook(request: Request, background_tasks: BackgroundTasks):
 
 
 async def process_frd_pipeline(
-    work_item_id: int,
-    request_id: str | None = None,
+    work_item_id: int, request_id: str | None = None
 ) -> None:
     logger.info(
         "FRD pipeline started | request_id=%s | work_item_id=%s",
@@ -162,10 +161,10 @@ async def process_frd_pipeline(
     frd_generator = FRDGeneratorService()
 
     try:
+        logger.info("STEP 1: Checking for existing FRD | work_item_id=%s", work_item_id)
         already_exists = await work_item_service.has_generated_frd(work_item_id)
         logger.info(
-            "Existing FRD check complete | request_id=%s | work_item_id=%s | already_exists=%s",
-            request_id,
+            "STEP 1 OK | work_item_id=%s | already_exists=%s",
             work_item_id,
             already_exists,
         )
@@ -178,10 +177,12 @@ async def process_frd_pipeline(
             )
             return
 
+        logger.info(
+            "STEP 2: Fetching work item documents | work_item_id=%s", work_item_id
+        )
         documents = await work_item_service.fetch_work_item_documents(work_item_id)
         logger.info(
-            "Documents fetched | request_id=%s | work_item_id=%s | count=%s",
-            request_id,
+            "STEP 2 OK | work_item_id=%s | document_count=%s",
             work_item_id,
             len(documents),
         )
@@ -194,19 +195,22 @@ async def process_frd_pipeline(
             )
             return
 
+        logger.info("STEP 3: Generating FRD | work_item_id=%s", work_item_id)
         frd_path = await frd_generator.generate_frd(
             work_item_id=work_item_id,
             documents=documents,
         )
-
         logger.info(
-            "FRD generated | request_id=%s | work_item_id=%s | path=%s",
-            request_id,
+            "STEP 3 OK | work_item_id=%s | frd_path=%s",
             work_item_id,
             frd_path,
         )
 
+        logger.info(
+            "STEP 4: Uploading FRD to work item | work_item_id=%s", work_item_id
+        )
         await work_item_service.upload_frd_to_work_item(work_item_id, frd_path)
+        logger.info("STEP 4 OK | work_item_id=%s", work_item_id)
 
         logger.info(
             "FRD pipeline completed successfully | request_id=%s | work_item_id=%s",
@@ -215,8 +219,6 @@ async def process_frd_pipeline(
         )
 
     except Exception as exc:
-        # IMPORTANT:
-        # Do not re-raise from a background task. Log the full failure and stop here.
         logger.exception(
             "FRD pipeline failed | request_id=%s | work_item_id=%s | error=%s",
             request_id,
